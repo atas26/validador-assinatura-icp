@@ -73,16 +73,24 @@ public class SignatureValidationService {
                 boolean anyPades = false;
                 boolean allChecked = true;
                 boolean anyInvalid = false;
-                boolean allByteRangeValid = true;
+
+                boolean allByteRangesWellFormed = true;
+                boolean anyByteRangeCoversWholeFile = false;
 
                 for (PDSignature pdSignature : signatures) {
                     SignatureInfo info = extractBasicSignatureInfo(pdSignature, idx++);
                     out.signatures.add(info);
 
-                    boolean byteRangeValid = isByteRangePresentAndWellFormed(pdSignature);
-                    if (!byteRangeValid) {
-                        allByteRangeValid = false;
+                    boolean byteRangeWellFormed = isByteRangePresentAndWellFormed(pdSignature, pdf.length);
+                    boolean byteRangeCoversDocument = byteRangeWellFormed && byteRangeCoversWholeFile(pdSignature, pdf.length);
+
+                    if (!byteRangeWellFormed) {
+                        allByteRangesWellFormed = false;
                         info.validatorErrors.add("ByteRange ausente ou malformado.");
+                    } else if (!byteRangeCoversDocument) {
+                        info.validatorWarnings.add("ByteRange bem formado, mas sem cobertura do arquivo PDF final. Pode haver assinatura anterior a atualização incremental ou conteúdo posterior não coberto.");
+                    } else {
+                        anyByteRangeCoversWholeFile = true;
                     }
 
                     if (isPadesSubFilter(pdSignature)) {
@@ -108,6 +116,7 @@ public class SignatureValidationService {
                         out.warnings.add("A assinatura " + info.index + " foi detectada, mas a validação técnica não foi concluída: " + demoiselle.message);
                     } else if (Boolean.TRUE.equals(demoiselle.valid)) {
                         anyValid = true;
+
                         if (Boolean.TRUE.equals(info.icpBrasil)) {
                             anyIcp = true;
                         }
@@ -116,17 +125,33 @@ public class SignatureValidationService {
                     }
                 }
 
-                out.byteRangeValid = allByteRangeValid;
-                out.signatureIntegrityValid = anyValid && allByteRangeValid;
+                boolean byteRangeValidForDocument = allByteRangesWellFormed && anyByteRangeCoversWholeFile;
+
+                out.byteRangeValid = byteRangeValidForDocument;
+                out.signatureIntegrityValid = anyValid && byteRangeValidForDocument;
                 out.standard = anyPades ? "PAdES-B" : "Assinatura PDF";
 
-                if (anyValid && anyIcp && allByteRangeValid) {
+                if (!allByteRangesWellFormed) {
+                    out.result = "invalid_signature_byte_range";
+                    out.valid = false;
+                    out.icpBrasil = anyIcp;
+                    out.signatureIntegrityValid = false;
+                    out.message = "Assinatura digital detectada, mas o ByteRange está ausente ou malformado.";
+                    out.errors.add("ByteRange ausente ou malformado. Não é possível concluir pela integridade do documento assinado.");
+                } else if (anyValid && !anyByteRangeCoversWholeFile) {
+                    out.result = "signature_valid_but_pdf_not_fully_covered";
+                    out.valid = false;
+                    out.icpBrasil = anyIcp;
+                    out.signatureIntegrityValid = false;
+                    out.message = "Assinatura tecnicamente validada, mas sem cobertura do arquivo PDF final.";
+                    out.errors.add("Nenhuma assinatura validada cobre o PDF final integralmente. Pode haver conteúdo posterior não coberto pela assinatura.");
+                } else if (anyValid && anyIcp && byteRangeValidForDocument) {
                     out.result = "valid_signature_basic_icp_identified";
                     out.valid = true;
                     out.icpBrasil = true;
                     out.message = "Assinatura PAdES-B validada pelo Demoiselle Signer, com certificado ICP-Brasil identificado.";
                     out.warnings.add("Cadeia integral, revogação por LCR ou OCSP, TSA e política de assinatura ainda não foram concluídas nesta etapa.");
-                } else if (anyValid && allByteRangeValid) {
+                } else if (anyValid && byteRangeValidForDocument) {
                     out.result = "valid_signature_unconfirmed_icp";
                     out.valid = true;
                     out.icpBrasil = false;
@@ -205,6 +230,7 @@ public class SignatureValidationService {
         info.padesLikely = isPadesSubFilter(sig);
 
         Date signDate = sig.getSignDate() == null ? null : sig.getSignDate().getTime();
+
         if (signDate != null) {
             info.signDate = DATE_FORMAT.format(signDate.toInstant().atZone(ZoneId.systemDefault()));
         }
@@ -224,7 +250,7 @@ public class SignatureValidationService {
                 || subFilter.contains("adbe.pkcs7.sha1");
     }
 
-    private boolean isByteRangePresentAndWellFormed(PDSignature sig) {
+    private boolean isByteRangePresentAndWellFormed(PDSignature sig, int pdfLength) {
         if (sig == null || sig.getByteRange() == null) {
             return false;
         }
@@ -241,7 +267,43 @@ public class SignatureValidationService {
             }
         }
 
-        return byteRange[0] == 0 && byteRange[1] > 0 && byteRange[2] > byteRange[1] && byteRange[3] > 0;
+        long start1 = byteRange[0];
+        long length1 = byteRange[1];
+        long start2 = byteRange[2];
+        long length2 = byteRange[3];
+
+        long end1 = start1 + length1;
+        long end2 = start2 + length2;
+
+        if (start1 != 0) {
+            return false;
+        }
+
+        if (length1 <= 0 || length2 <= 0) {
+            return false;
+        }
+
+        if (start2 <= end1) {
+            return false;
+        }
+
+        return end2 <= pdfLength;
+    }
+
+    private boolean byteRangeCoversWholeFile(PDSignature sig, int pdfLength) {
+        if (sig == null || sig.getByteRange() == null) {
+            return false;
+        }
+
+        int[] byteRange = sig.getByteRange();
+
+        if (byteRange.length != 4) {
+            return false;
+        }
+
+        long end2 = (long) byteRange[2] + (long) byteRange[3];
+
+        return end2 == pdfLength;
     }
 
     private byte[] safeGetContents(PDSignature sig, byte[] pdf) throws Exception {
@@ -366,11 +428,13 @@ public class SignatureValidationService {
         tryReadList(signatureInformation, "getValidatorWarnings", info.validatorWarnings);
 
         Object invalid = tryInvoke(signatureInformation, "isInvalidSignature");
+
         if (invalid instanceof Boolean && Boolean.TRUE.equals(invalid)) {
             info.demoiselleValid = false;
         }
 
         Object icpCert = tryInvoke(signatureInformation, "getIcpBrasilcertificate");
+
         if (icpCert != null) {
             info.icpBrasil = true;
         }
@@ -404,6 +468,7 @@ public class SignatureValidationService {
 
     private String safeMessage(Exception e) {
         Throwable t = e.getCause() != null ? e.getCause() : e;
+
         return t.getMessage() == null ? t.toString() : t.getMessage();
     }
 
