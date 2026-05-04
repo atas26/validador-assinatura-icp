@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: validador-assinatura-icp
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: PORT
+        value: 8080
+      - key: JAVA_TOOL_OPTIONS
+        value: -Dfile.encoding=UTF-8
+      - key: MAX_FILE_SIZE
+        value: 50MB
