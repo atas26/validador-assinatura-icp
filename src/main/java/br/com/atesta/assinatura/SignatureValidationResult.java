@@ -23,6 +23,14 @@ public class SignatureValidationResult {
     public Boolean signatureIntegrityValid;
     public Boolean byteRangeValid;
     public Boolean finalDocumentCovered;
+    public Boolean finalDocumentAcceptable;
+
+    // Atualização incremental posterior à assinatura
+    public Boolean postSignatureUpdateDetected;
+    public Boolean postSignatureUpdateAccepted;
+    public String postSignatureUpdateType;
+    public Long postSignatureUpdateBytes;
+    public String postSignatureUpdateMessage;
 
     // Cadeia de certificação
     public Boolean chainValid;
@@ -68,6 +76,12 @@ public class SignatureValidationResult {
         result.signatureIntegrityValid = false;
         result.byteRangeValid = false;
         result.finalDocumentCovered = false;
+        result.finalDocumentAcceptable = false;
+        result.postSignatureUpdateDetected = false;
+        result.postSignatureUpdateAccepted = false;
+        result.postSignatureUpdateType = null;
+        result.postSignatureUpdateBytes = null;
+        result.postSignatureUpdateMessage = null;
 
         result.chainValid = false;
         result.trustAnchor = null;
