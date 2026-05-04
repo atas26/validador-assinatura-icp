@@ -22,6 +22,7 @@ public class SignatureValidationResult {
     // Integridade da assinatura
     public Boolean signatureIntegrityValid;
     public Boolean byteRangeValid;
+    public Boolean finalDocumentCovered;
 
     // Cadeia de certificação
     public Boolean chainValid;
@@ -66,6 +67,7 @@ public class SignatureValidationResult {
 
         result.signatureIntegrityValid = false;
         result.byteRangeValid = false;
+        result.finalDocumentCovered = false;
 
         result.chainValid = false;
         result.trustAnchor = null;
