@@ -8,6 +8,7 @@ import java.net.HttpURLConnection;
 import java.net.URI;
 import java.net.URL;
 import java.lang.reflect.Method;
+import java.nio.charset.StandardCharsets;
 import java.security.Security;
 import java.security.cert.CertPath;
 import java.security.cert.CertPathBuilder;
@@ -126,7 +127,11 @@ public class SignatureValidationService {
                 boolean anyInvalid = false;
                 boolean allByteRangesWellFormed = true;
                 boolean anyByteRangeCoversWholeFile = false;
+                boolean anyFinalDocumentAcceptable = false;
                 boolean anySignatureWithoutFinalCoverage = false;
+                boolean anyPostSignatureUpdateDetected = false;
+                boolean anyPostSignatureUpdateAccepted = false;
+                boolean anyPostSignatureUpdateUnknown = false;
                 boolean anyChainValid = false;
                 boolean anyChainChecked = false;
                 boolean anyRevocationChecked = false;
@@ -139,15 +144,32 @@ public class SignatureValidationService {
 
                     boolean byteRangeWellFormed = isByteRangePresentAndWellFormed(pdSignature, pdf.length);
                     boolean byteRangeCoversDocument = byteRangeWellFormed && byteRangeCoversWholeFile(pdSignature, pdf.length);
+                    PostSignatureUpdateAnalysis postSignatureUpdate = analyzePostSignatureUpdate(pdSignature, pdf);
 
                     if (!byteRangeWellFormed) {
                         allByteRangesWellFormed = false;
                         info.validatorErrors.add("ByteRange ausente ou malformado.");
-                    } else if (!byteRangeCoversDocument) {
-                        anySignatureWithoutFinalCoverage = true;
-                        info.validatorWarnings.add("ByteRange válido para a revisão assinada, mas sem cobertura do arquivo PDF final. Pode haver atualização incremental ou conteúdo posterior não coberto por esta assinatura.");
-                    } else {
+                    } else if (byteRangeCoversDocument) {
                         anyByteRangeCoversWholeFile = true;
+                        anyFinalDocumentAcceptable = true;
+                    } else {
+                        anySignatureWithoutFinalCoverage = true;
+                        anyPostSignatureUpdateDetected = anyPostSignatureUpdateDetected || postSignatureUpdate.detected;
+
+                        if (postSignatureUpdate.detected && (out.postSignatureUpdateType == null || out.postSignatureUpdateType.isBlank())) {
+                            out.postSignatureUpdateType = postSignatureUpdate.type;
+                            out.postSignatureUpdateMessage = postSignatureUpdate.message;
+                            out.postSignatureUpdateBytes = postSignatureUpdate.bytes;
+                        }
+
+                        if (postSignatureUpdate.accepted) {
+                            anyPostSignatureUpdateAccepted = true;
+                            anyFinalDocumentAcceptable = true;
+                            info.validatorWarnings.add(postSignatureUpdate.message);
+                        } else {
+                            anyPostSignatureUpdateUnknown = true;
+                            info.validatorWarnings.add(postSignatureUpdate.message);
+                        }
                     }
 
                     if (isPadesSubFilter(pdSignature)) {
@@ -251,9 +273,13 @@ public class SignatureValidationService {
 
                 boolean byteRangesWellFormed = allByteRangesWellFormed;
                 boolean finalDocumentCovered = anyByteRangeCoversWholeFile;
+                boolean finalDocumentAcceptable = anyFinalDocumentAcceptable;
 
                 out.byteRangeValid = byteRangesWellFormed;
                 out.finalDocumentCovered = finalDocumentCovered;
+                out.finalDocumentAcceptable = finalDocumentAcceptable;
+                out.postSignatureUpdateDetected = anyPostSignatureUpdateDetected;
+                out.postSignatureUpdateAccepted = anyPostSignatureUpdateAccepted;
                 out.signatureIntegrityValid = anyValid && byteRangesWellFormed;
                 out.chainValid = anyChainValid;
                 out.standard = anyPades ? "PAdES-B" : "Assinatura PDF";
@@ -268,14 +294,19 @@ public class SignatureValidationService {
                     return out;
                 }
 
-                if (!finalDocumentCovered) {
+                if (!finalDocumentAcceptable) {
                     out.result = "signature_valid_but_pdf_not_fully_covered";
                     out.valid = false;
                     out.icpBrasil = anyIcp;
                     out.message = anySignatureWithoutFinalCoverage
-                            ? "Assinatura validada sobre a revisão assinada, mas sem cobertura integral do arquivo PDF final analisado."
+                            ? "Assinatura validada sobre a revisão assinada, mas a atualização incremental posterior não foi classificada como técnica permitida."
                             : "Assinatura detectada, mas nenhuma assinatura cobre o arquivo PDF final analisado.";
-                    out.warnings.add("Para aceitação automática, o PDF final deve estar coberto por assinatura válida. Se houver atualização incremental posterior, ela precisa ser analisada tecnicamente.");
+
+                    if (anyPostSignatureUpdateUnknown) {
+                        out.warnings.add("Foi detectada atualização incremental posterior à revisão assinada. A ferramenta não conseguiu classificá-la como atualização técnica de validação, carimbo do tempo ou assinatura adicional. Para aceitação automática, o conteúdo posterior deve ser analisado tecnicamente.");
+                    } else {
+                        out.warnings.add("Para aceitação automática, o PDF final deve estar coberto por assinatura válida ou por atualização incremental técnica classificada.");
+                    }
                     return out;
                 }
 
@@ -287,12 +318,19 @@ public class SignatureValidationService {
                     out.revoked = true;
                     out.message = "Assinatura PAdES-B validada, com cadeia ICP-Brasil reconhecida, mas o certificado consta como revogado na LCR consultada.";
                 } else if (anyValid && anyIcp && anyChainValid && anyRevocationChecked && anyNotRevoked) {
-                    out.result = "valid_icp_brasil_chain_crl";
+                    out.result = finalDocumentCovered
+                            ? "valid_icp_brasil_chain_crl"
+                            : "valid_icp_brasil_chain_crl_with_permitted_incremental_update";
                     out.valid = true;
                     out.icpBrasil = true;
                     out.revocationChecked = true;
                     out.revoked = false;
-                    out.message = "Assinatura PAdES-B validada. Certificado ICP-Brasil identificado. Cadeia de certificação validada até âncora confiável da ICP-Brasil. Consulta de revogação por LCR realizada sem identificação de revogação.";
+                    out.message = finalDocumentCovered
+                            ? "Assinatura PAdES-B validada. Certificado ICP-Brasil identificado. Cadeia de certificação validada até âncora confiável da ICP-Brasil. Consulta de revogação por LCR realizada sem identificação de revogação."
+                            : "Assinatura PAdES-B validada sobre a revisão assinada. Certificado ICP-Brasil identificado. Cadeia validada até âncora confiável da ICP-Brasil. Consulta de revogação por LCR realizada sem identificação de revogação. A atualização incremental posterior foi classificada como técnica permitida.";
+                    if (!finalDocumentCovered && anyPostSignatureUpdateAccepted) {
+                        out.warnings.add("O PDF final contém atualização incremental posterior à assinatura. A atualização foi classificada como técnica permitida: " + safeText(out.postSignatureUpdateType) + ".");
+                    }
                     out.warnings.add("OCSP, TSA e política de assinatura ainda serão tratados nas próximas etapas.");
                 } else if (anyValid && anyIcp && anyChainValid) {
                     out.result = "valid_icp_brasil_chain_revocation_not_checked";
@@ -352,6 +390,12 @@ public class SignatureValidationService {
         out.signatureIntegrityValid = null;
         out.byteRangeValid = null;
         out.finalDocumentCovered = null;
+        out.finalDocumentAcceptable = null;
+        out.postSignatureUpdateDetected = false;
+        out.postSignatureUpdateAccepted = false;
+        out.postSignatureUpdateType = null;
+        out.postSignatureUpdateBytes = null;
+        out.postSignatureUpdateMessage = null;
 
         out.chainValid = null;
         out.trustAnchor = null;
@@ -461,7 +505,143 @@ public class SignatureValidationService {
 
         long end2 = (long) byteRange[2] + (long) byteRange[3];
 
-        return end2 == pdfLength;
+        if (end2 == pdfLength) {
+            return true;
+        }
+
+        return isOnlyTrailingPaddingAfterSignedRevision(sig, pdfLength, null);
+    }
+
+    private PostSignatureUpdateAnalysis analyzePostSignatureUpdate(PDSignature sig, byte[] pdf) {
+        PostSignatureUpdateAnalysis analysis = new PostSignatureUpdateAnalysis();
+        analysis.detected = false;
+        analysis.accepted = false;
+        analysis.type = null;
+        analysis.bytes = 0L;
+        analysis.message = "Sem atualização incremental posterior à revisão assinada.";
+
+        if (sig == null || sig.getByteRange() == null || pdf == null) {
+            analysis.detected = true;
+            analysis.type = "unknown";
+            analysis.message = "Não foi possível analisar a cobertura do ByteRange.";
+            return analysis;
+        }
+
+        int[] byteRange = sig.getByteRange();
+        if (byteRange.length != 4) {
+            analysis.detected = true;
+            analysis.type = "invalid_byte_range";
+            analysis.message = "ByteRange com quantidade inesperada de segmentos.";
+            return analysis;
+        }
+
+        long signedRevisionEnd = (long) byteRange[2] + (long) byteRange[3];
+        long remaining = (long) pdf.length - signedRevisionEnd;
+
+        if (remaining <= 0) {
+            analysis.accepted = true;
+            return analysis;
+        }
+
+        analysis.detected = true;
+        analysis.bytes = remaining;
+
+        if (remaining > Integer.MAX_VALUE || signedRevisionEnd < 0 || signedRevisionEnd > pdf.length) {
+            analysis.type = "unknown";
+            analysis.message = "Atualização posterior não analisável pelo tamanho ou posição informada no ByteRange.";
+            return analysis;
+        }
+
+        int offset = (int) signedRevisionEnd;
+        int length = (int) remaining;
+
+        if (isOnlyTrailingPadding(pdf, offset, length)) {
+            analysis.accepted = true;
+            analysis.type = "trailing_padding";
+            analysis.message = "Foram localizados apenas bytes finais sem conteúdo material após a revisão assinada.";
+            return analysis;
+        }
+
+        String tail = new String(pdf, offset, length, StandardCharsets.ISO_8859_1);
+        String compact = tail.replace("\u0000", "");
+
+        boolean hasDss = containsAny(compact, "/DSS", "/VRI", "/OCSPs", "/CRLs", "/Certs");
+        boolean hasDocTimeStamp = containsAny(compact, "/DocTimeStamp", "/SubFilter/ETSI.RFC3161", "/SubFilter /ETSI.RFC3161", "ETSI.RFC3161");
+        boolean hasAdditionalSignature = containsAny(compact, "/Type/Sig", "/Type /Sig")
+                && containsAny(compact, "/ByteRange")
+                && containsAny(compact, "/Contents");
+
+        boolean hasPageContentRisk = containsAny(compact, "/Subtype/Image", "/XObject", "/Font", "/MediaBox", "/CropBox", "/Rotate");
+        boolean hasTextDrawingRisk = containsAny(compact, " BT", " ET", " Tj", " TJ", " Do");
+
+        if ((hasDss || hasDocTimeStamp || hasAdditionalSignature) && !hasPageContentRisk && !hasTextDrawingRisk) {
+            analysis.accepted = true;
+            if (hasDocTimeStamp) {
+                analysis.type = "document_timestamp_update";
+                analysis.message = "Atualização incremental posterior classificada como carimbo do tempo documental ou material técnico correlato.";
+            } else if (hasDss) {
+                analysis.type = "dss_ltv_update";
+                analysis.message = "Atualização incremental posterior classificada como inclusão de dados de validação DSS/LTV.";
+            } else {
+                analysis.type = "additional_signature_update";
+                analysis.message = "Atualização incremental posterior classificada como acréscimo de assinatura digital adicional.";
+            }
+            return analysis;
+        }
+
+        analysis.type = "unknown_incremental_update";
+        analysis.message = "Foi detectada atualização incremental posterior à revisão assinada, mas ela não foi classificada como DSS/LTV, carimbo do tempo ou assinatura adicional sem indícios de alteração de conteúdo.";
+        return analysis;
+    }
+
+    private boolean isOnlyTrailingPaddingAfterSignedRevision(PDSignature sig, int pdfLength, byte[] pdf) {
+        if (sig == null || sig.getByteRange() == null || pdf == null) {
+            return false;
+        }
+
+        int[] byteRange = sig.getByteRange();
+        if (byteRange.length != 4) {
+            return false;
+        }
+
+        long signedRevisionEnd = (long) byteRange[2] + (long) byteRange[3];
+        long remaining = (long) pdfLength - signedRevisionEnd;
+
+        if (remaining <= 0) {
+            return true;
+        }
+
+        if (remaining > Integer.MAX_VALUE || signedRevisionEnd < 0 || signedRevisionEnd > pdfLength) {
+            return false;
+        }
+
+        return isOnlyTrailingPadding(pdf, (int) signedRevisionEnd, (int) remaining);
+    }
+
+    private boolean isOnlyTrailingPadding(byte[] pdf, int offset, int length) {
+        if (pdf == null || offset < 0 || length < 0 || offset + length > pdf.length) {
+            return false;
+        }
+
+        for (int i = offset; i < offset + length; i++) {
+            byte b = pdf[i];
+            if (!(b == 0x00 || b == 0x09 || b == 0x0A || b == 0x0C || b == 0x0D || b == 0x20)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private boolean containsAny(String text, String... tokens) {
+        if (text == null) {
+            return false;
+        }
+        for (String token : tokens) {
+            if (token != null && text.contains(token)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private byte[] safeGetContents(PDSignature sig, byte[] pdf) throws Exception {
@@ -1152,9 +1332,21 @@ public class SignatureValidationService {
         }
     }
 
+    private String safeText(String value) {
+        return value == null || value.isBlank() ? "não informada" : value;
+    }
+
     private String safeMessage(Exception e) {
         Throwable t = e.getCause() != null ? e.getCause() : e;
         return t.getMessage() == null ? t.toString() : t.getMessage();
+    }
+
+    private static class PostSignatureUpdateAnalysis {
+        boolean detected;
+        boolean accepted;
+        String type;
+        Long bytes;
+        String message;
     }
 
     private static class DemoiselleOutcome {
