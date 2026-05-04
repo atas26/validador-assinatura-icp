@@ -38,15 +38,19 @@ public class SignatureValidationService {
 
         String name = file.getOriginalFilename() == null ? "" : file.getOriginalFilename().toLowerCase();
         String type = file.getContentType() == null ? "" : file.getContentType().toLowerCase();
+
         if (!name.endsWith(".pdf") && !type.contains("pdf")) {
             return SignatureValidationResult.error("Envie um arquivo PDF para validação de assinatura.");
         }
 
         try {
             byte[] pdf = file.getBytes();
+
             SignatureValidationResult out = new SignatureValidationResult();
+            initializeDefaults(out);
+
             out.ok = true;
-            out.validationLevel = "demoiselle_pades_poc";
+            out.validationLevel = "pades_b_basic_validation";
 
             try (PDDocument document = PDDocument.load(pdf)) {
                 List<PDSignature> signatures = document.getSignatureDictionaries();
@@ -58,19 +62,32 @@ public class SignatureValidationService {
                     out.icpBrasil = false;
                     out.standard = null;
                     out.message = "Assinatura digital não localizada no PDF.";
+                    out.signatureIntegrityValid = false;
+                    out.byteRangeValid = false;
                     return out;
                 }
 
-                out.standard = "PAdES provável";
                 int idx = 1;
                 boolean anyValid = false;
                 boolean anyIcp = false;
+                boolean anyPades = false;
                 boolean allChecked = true;
                 boolean anyInvalid = false;
+                boolean allByteRangeValid = true;
 
                 for (PDSignature pdSignature : signatures) {
                     SignatureInfo info = extractBasicSignatureInfo(pdSignature, idx++);
                     out.signatures.add(info);
+
+                    boolean byteRangeValid = isByteRangePresentAndWellFormed(pdSignature);
+                    if (!byteRangeValid) {
+                        allByteRangeValid = false;
+                        info.validatorErrors.add("ByteRange ausente ou malformado.");
+                    }
+
+                    if (isPadesSubFilter(pdSignature)) {
+                        anyPades = true;
+                    }
 
                     byte[] contents = safeGetContents(pdSignature, pdf);
                     byte[] signedContent = safeGetSignedContent(pdSignature, pdf);
@@ -78,15 +95,17 @@ public class SignatureValidationService {
                     enrichWithCmsCertificateInfo(info, contents);
 
                     DemoiselleOutcome demoiselle = tryValidateWithDemoiselle(signedContent, contents, info);
+
                     info.demoiselleChecked = demoiselle.checked;
                     info.demoiselleValid = demoiselle.valid;
+
                     if (demoiselle.icpBrasil != null) {
                         info.icpBrasil = demoiselle.icpBrasil;
                     }
 
                     if (!demoiselle.checked) {
                         allChecked = false;
-                        out.warnings.add("A assinatura " + info.index + " foi detectada, mas a validação Demoiselle não foi concluída: " + demoiselle.message);
+                        out.warnings.add("A assinatura " + info.index + " foi detectada, mas a validação técnica não foi concluída: " + demoiselle.message);
                     } else if (Boolean.TRUE.equals(demoiselle.valid)) {
                         anyValid = true;
                         if (Boolean.TRUE.equals(info.icpBrasil)) {
@@ -97,27 +116,35 @@ public class SignatureValidationService {
                     }
                 }
 
-                if (anyValid && anyIcp) {
-                    out.result = "valid_icp_brasil";
+                out.byteRangeValid = allByteRangeValid;
+                out.signatureIntegrityValid = anyValid && allByteRangeValid;
+                out.standard = anyPades ? "PAdES-B" : "Assinatura PDF";
+
+                if (anyValid && anyIcp && allByteRangeValid) {
+                    out.result = "valid_signature_basic_icp_identified";
                     out.valid = true;
                     out.icpBrasil = true;
-                    out.message = "Assinatura PAdES validada pelo Demoiselle Signer, com indício de certificado ICP-Brasil.";
-                } else if (anyValid) {
+                    out.message = "Assinatura PAdES-B validada pelo Demoiselle Signer, com certificado ICP-Brasil identificado.";
+                    out.warnings.add("Cadeia integral, revogação por LCR ou OCSP, TSA e política de assinatura ainda não foram concluídas nesta etapa.");
+                } else if (anyValid && allByteRangeValid) {
                     out.result = "valid_signature_unconfirmed_icp";
                     out.valid = true;
                     out.icpBrasil = false;
-                    out.message = "Assinatura validada pelo Demoiselle Signer, mas a cadeia ICP-Brasil não foi confirmada automaticamente nesta prova de conceito.";
+                    out.message = "Assinatura validada, mas a identificação como certificado ICP-Brasil não foi confirmada automaticamente.";
+                    out.warnings.add("Cadeia integral, revogação por LCR ou OCSP, TSA e política de assinatura ainda não foram concluídas nesta etapa.");
                 } else if (anyInvalid && allChecked) {
                     out.result = "invalid_signature";
                     out.valid = false;
                     out.icpBrasil = false;
-                    out.message = "Assinatura detectada, mas a validação retornou erro ou restrição.";
+                    out.signatureIntegrityValid = false;
+                    out.message = "Assinatura detectada, mas a validação técnica retornou erro ou restrição.";
                 } else {
-                    out.result = "signature_detected";
+                    out.result = "signature_detected_not_conclusive";
                     out.valid = null;
                     out.icpBrasil = null;
-                    out.message = "Assinatura digital detectada. A tentativa de validação Demoiselle não foi conclusiva nesta prova de conceito.";
-                    out.warnings.add("Não use este retorno como validação ICP-Brasil definitiva sem teste com amostra representativa e conferência do relatório técnico.");
+                    out.signatureIntegrityValid = null;
+                    out.message = "Assinatura digital detectada, mas a validação técnica não foi conclusiva.";
+                    out.warnings.add("Sem validação conclusiva, o resultado não deve ser tratado como conformidade da assinatura.");
                 }
 
                 return out;
@@ -127,8 +154,47 @@ public class SignatureValidationService {
         }
     }
 
+    private void initializeDefaults(SignatureValidationResult out) {
+        out.ok = false;
+        out.result = "not_processed";
+
+        out.hasSignature = false;
+        out.valid = null;
+        out.icpBrasil = null;
+
+        out.standard = null;
+        out.validationLevel = "pades_b_basic_validation";
+        out.message = null;
+
+        out.signatureIntegrityValid = null;
+        out.byteRangeValid = null;
+
+        out.chainValid = null;
+        out.trustAnchor = null;
+
+        out.revocationChecked = false;
+        out.revocationMethod = null;
+        out.revoked = null;
+        out.crlUrl = null;
+        out.crlIssuer = null;
+        out.crlThisUpdate = null;
+        out.crlNextUpdate = null;
+        out.revocationDate = null;
+        out.revocationReason = null;
+        out.ocspUrl = null;
+
+        out.timestampPresent = false;
+        out.timestampValid = null;
+        out.timestampAuthority = null;
+        out.timestampTime = null;
+
+        out.policyOid = null;
+        out.policyName = null;
+    }
+
     private SignatureInfo extractBasicSignatureInfo(PDSignature sig, int index) {
         SignatureInfo info = new SignatureInfo();
+
         info.index = index;
         info.name = sig.getName();
         info.reason = sig.getReason();
@@ -136,12 +202,46 @@ public class SignatureValidationService {
         info.contactInfo = sig.getContactInfo();
         info.filter = sig.getFilter();
         info.subFilter = sig.getSubFilter();
-        info.padesLikely = sig.getSubFilter() != null && sig.getSubFilter().toLowerCase().contains("etsi");
+        info.padesLikely = isPadesSubFilter(sig);
+
         Date signDate = sig.getSignDate() == null ? null : sig.getSignDate().getTime();
         if (signDate != null) {
             info.signDate = DATE_FORMAT.format(signDate.toInstant().atZone(ZoneId.systemDefault()));
         }
+
         return info;
+    }
+
+    private boolean isPadesSubFilter(PDSignature sig) {
+        if (sig == null || sig.getSubFilter() == null) {
+            return false;
+        }
+
+        String subFilter = sig.getSubFilter().toLowerCase();
+
+        return subFilter.contains("etsi.cades.detached")
+                || subFilter.contains("adbe.pkcs7.detached")
+                || subFilter.contains("adbe.pkcs7.sha1");
+    }
+
+    private boolean isByteRangePresentAndWellFormed(PDSignature sig) {
+        if (sig == null || sig.getByteRange() == null) {
+            return false;
+        }
+
+        int[] byteRange = sig.getByteRange();
+
+        if (byteRange.length != 4) {
+            return false;
+        }
+
+        for (int value : byteRange) {
+            if (value < 0) {
+                return false;
+            }
+        }
+
+        return byteRange[0] == 0 && byteRange[1] > 0 && byteRange[2] > byteRange[1] && byteRange[3] > 0;
     }
 
     private byte[] safeGetContents(PDSignature sig, byte[] pdf) throws Exception {
@@ -158,26 +258,33 @@ public class SignatureValidationService {
             if (contents == null || contents.length == 0) {
                 return;
             }
+
             CMSSignedData cms = new CMSSignedData(contents);
             SignerInformationStore signers = cms.getSignerInfos();
             Collection<SignerInformation> signerInfos = signers.getSigners();
+
             Store certStore = cms.getCertificates();
             CertificateFactory factory = CertificateFactory.getInstance("X.509");
 
             for (SignerInformation signer : signerInfos) {
                 Collection matches = certStore.getMatches(signer.getSID());
+
                 if (!matches.isEmpty()) {
                     Object holder = matches.iterator().next();
                     Method getEncoded = holder.getClass().getMethod("getEncoded");
                     byte[] certBytes = (byte[]) getEncoded.invoke(holder);
+
                     X509Certificate cert = (X509Certificate) factory.generateCertificate(new ByteArrayInputStream(certBytes));
+
                     info.certificateSubject = cert.getSubjectX500Principal().getName();
                     info.certificateIssuer = cert.getIssuerX500Principal().getName();
                     info.certificateNotBefore = DATE_FORMAT.format(cert.getNotBefore().toInstant().atZone(ZoneId.systemDefault()));
                     info.certificateNotAfter = DATE_FORMAT.format(cert.getNotAfter().toInstant().atZone(ZoneId.systemDefault()));
+
                     if (looksLikeIcpBrasil(cert)) {
                         info.icpBrasil = true;
                     }
+
                     return;
                 }
             }
@@ -187,15 +294,23 @@ public class SignatureValidationService {
     }
 
     private boolean looksLikeIcpBrasil(X509Certificate cert) {
-        if (cert == null) return false;
+        if (cert == null) {
+            return false;
+        }
+
         String subject = cert.getSubjectX500Principal().getName().toUpperCase();
         String issuer = cert.getIssuerX500Principal().getName().toUpperCase();
-        return subject.contains("ICP-BRASIL") || issuer.contains("ICP-BRASIL") || issuer.contains("ICP BRASIL") || subject.contains("ICP BRASIL");
+
+        return subject.contains("ICP-BRASIL")
+                || issuer.contains("ICP-BRASIL")
+                || subject.contains("ICP BRASIL")
+                || issuer.contains("ICP BRASIL");
     }
 
     @SuppressWarnings({"unchecked", "rawtypes"})
     private DemoiselleOutcome tryValidateWithDemoiselle(byte[] signedContent, byte[] signature, SignatureInfo info) {
         DemoiselleOutcome outcome = new DemoiselleOutcome();
+
         try {
             if (signedContent == null || signedContent.length == 0 || signature == null || signature.length == 0) {
                 outcome.checked = false;
@@ -206,12 +321,13 @@ public class SignatureValidationService {
 
             Class<?> checkerClass = Class.forName("org.demoiselle.signer.policy.impl.pades.pkcs7.impl.PAdESChecker");
             Object checker = checkerClass.getDeclaredConstructor().newInstance();
+
             Method method = checkerClass.getMethod("checkDetachedSignature", byte[].class, byte[].class);
             Object result = method.invoke(checker, signedContent, signature);
 
             outcome.checked = true;
             outcome.valid = true;
-            outcome.message = "Demoiselle retornou resultado de validação.";
+            outcome.message = "Validação técnica PAdES executada.";
 
             if (result instanceof List list) {
                 for (Object signatureInformation : list) {
@@ -219,7 +335,12 @@ public class SignatureValidationService {
                 }
             }
 
+            if (Boolean.FALSE.equals(info.demoiselleValid) || !info.validatorErrors.isEmpty()) {
+                outcome.valid = false;
+            }
+
             outcome.icpBrasil = Boolean.TRUE.equals(info.icpBrasil);
+
             return outcome;
         } catch (ClassNotFoundException e) {
             outcome.checked = false;
@@ -236,7 +357,10 @@ public class SignatureValidationService {
     }
 
     private void readDemoiselleSignatureInformation(Object signatureInformation, SignatureInfo info) {
-        if (signatureInformation == null) return;
+        if (signatureInformation == null) {
+            return;
+        }
+
         tryReadList(signatureInformation, "getValidatorErrors", info.validatorErrors);
         tryReadList(signatureInformation, "getValidatorWarnins", info.validatorWarnings);
         tryReadList(signatureInformation, "getValidatorWarnings", info.validatorWarnings);
@@ -256,9 +380,12 @@ public class SignatureValidationService {
     private void tryReadList(Object target, String methodName, List<String> destination) {
         try {
             Object value = tryInvoke(target, methodName);
+
             if (value instanceof Iterable iterable) {
                 for (Object item : iterable) {
-                    if (item != null) destination.add(String.valueOf(item));
+                    if (item != null) {
+                        destination.add(String.valueOf(item));
+                    }
                 }
             }
         } catch (Exception ignored) {
