@@ -571,10 +571,36 @@ public class SignatureValidationService {
                 && containsAny(compact, "/ByteRange")
                 && containsAny(compact, "/Contents");
 
+        boolean hasXrefTrailerOnly = containsAny(compact, "xref")
+                && containsAny(compact, "trailer")
+                && containsAny(compact, "startxref")
+                && containsAny(compact, "%%EOF")
+                && !containsPdfObjectDeclaration(compact);
+
+        boolean hasXrefStreamOnly = containsAny(compact, "/Type/XRef", "/Type /XRef")
+                && containsAny(compact, "startxref")
+                && containsAny(compact, "%%EOF")
+                && !containsAny(compact, "/Page", "/Pages", "/Contents", "/XObject", "/Font", "/Annots", "/AcroForm");
+
         boolean hasPageContentRisk = containsAny(compact, "/Subtype/Image", "/XObject", "/Font", "/MediaBox", "/CropBox", "/Rotate");
         boolean hasTextDrawingRisk = containsAny(compact, " BT", " ET", " Tj", " TJ", " Do");
+        boolean hasPageTreeRisk = containsAny(compact, "/Page", "/Pages", "/Annots", "/AcroForm", "/Resources");
 
-        if ((hasDss || hasDocTimeStamp || hasAdditionalSignature) && !hasPageContentRisk && !hasTextDrawingRisk) {
+        if (hasXrefTrailerOnly) {
+            analysis.accepted = true;
+            analysis.type = "xref_trailer_only_update";
+            analysis.message = "Atualização posterior classificada como atualização estrutural de xref/trailer, sem objeto PDF novo e sem indício de alteração de conteúdo.";
+            return analysis;
+        }
+
+        if (hasXrefStreamOnly) {
+            analysis.accepted = true;
+            analysis.type = "xref_stream_only_update";
+            analysis.message = "Atualização posterior classificada como atualização estrutural de xref stream, sem indício de alteração de conteúdo.";
+            return analysis;
+        }
+
+        if ((hasDss || hasDocTimeStamp || hasAdditionalSignature) && !hasPageContentRisk && !hasTextDrawingRisk && !hasPageTreeRisk) {
             analysis.accepted = true;
             if (hasDocTimeStamp) {
                 analysis.type = "document_timestamp_update";
@@ -590,8 +616,22 @@ public class SignatureValidationService {
         }
 
         analysis.type = "unknown_incremental_update";
-        analysis.message = "Foi detectada atualização incremental posterior à revisão assinada, mas ela não foi classificada como DSS/LTV, carimbo do tempo ou assinatura adicional sem indícios de alteração de conteúdo.";
+        analysis.message = "Foi detectada atualização incremental posterior à revisão assinada, mas ela não foi classificada como atualização estrutural, DSS/LTV, carimbo do tempo ou assinatura adicional sem indícios de alteração de conteúdo.";
         return analysis;
+    }
+
+    private boolean containsPdfObjectDeclaration(String text) {
+        if (text == null || text.isBlank()) {
+            return false;
+        }
+
+        String[] lines = text.split("\\R");
+        for (String line : lines) {
+            if (line != null && line.trim().matches("^\\d+\\s+\\d+\\s+obj\\b.*")) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private boolean isOnlyTrailingPaddingAfterSignedRevision(PDSignature sig, int pdfLength, byte[] pdf) {
