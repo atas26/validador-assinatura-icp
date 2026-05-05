@@ -63,6 +63,8 @@ public class SignatureValidationResult {
     // Política de assinatura
     public String policyOid;
     public String policyName;
+    public Boolean policyDeclared;
+    public Boolean policyRecognized;
 
     public static SignatureValidationResult error(String message) {
         SignatureValidationResult result = new SignatureValidationResult();
@@ -114,6 +116,8 @@ public class SignatureValidationResult {
 
         result.policyOid = null;
         result.policyName = null;
+        result.policyDeclared = false;
+        result.policyRecognized = false;
 
         result.errors.add(message);
 
