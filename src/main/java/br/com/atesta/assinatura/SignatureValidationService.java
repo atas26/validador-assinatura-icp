@@ -10,6 +10,7 @@ import java.net.URI;
 import java.net.URL;
 import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.security.Security;
 import java.security.cert.CertPath;
 import java.security.cert.CertPathBuilder;
@@ -26,6 +27,7 @@ import java.security.cert.X509CRLEntry;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.LinkedHashSet;
 import java.util.Date;
@@ -37,7 +39,11 @@ import java.util.regex.Pattern;
 
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.pdmodel.interactive.digitalsignature.PDSignature;
+import org.bouncycastle.asn1.ASN1Encodable;
+import org.bouncycastle.asn1.ASN1ObjectIdentifier;
 import org.bouncycastle.asn1.ASN1OctetString;
+import org.bouncycastle.asn1.cms.Attribute;
+import org.bouncycastle.asn1.cms.AttributeTable;
 import org.bouncycastle.asn1.DERIA5String;
 import org.bouncycastle.asn1.x509.AccessDescription;
 import org.bouncycastle.asn1.x509.AuthorityInformationAccess;
@@ -67,8 +73,11 @@ import org.bouncycastle.operator.jcajce.JcaDigestCalculatorProviderBuilder;
 import org.bouncycastle.cms.CMSSignedData;
 import org.bouncycastle.cms.SignerInformation;
 import org.bouncycastle.cms.SignerInformationStore;
+import org.bouncycastle.cms.jcajce.JcaSimpleSignerInfoVerifierBuilder;
 import org.bouncycastle.jce.provider.BouncyCastleProvider;
 import org.bouncycastle.util.Store;
+import org.bouncycastle.tsp.TimeStampToken;
+import org.bouncycastle.tsp.TimeStampTokenInfo;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
 
@@ -94,6 +103,7 @@ public class SignatureValidationService {
      * ICP_TRUST_ANCHORS_DIR=/caminho/dos/certificados
      */
     private static final String TRUST_ANCHOR_RESOURCE_DIR = "icp-brasil/trust-anchors/";
+    private static final ASN1ObjectIdentifier ID_AA_SIGNATURE_TIMESTAMP_TOKEN = new ASN1ObjectIdentifier("1.2.840.113549.1.9.16.2.14");
 
     static {
         if (Security.getProvider(BouncyCastleProvider.PROVIDER_NAME) == null) {
@@ -157,6 +167,8 @@ public class SignatureValidationService {
                 boolean anyRevocationChecked = false;
                 boolean anyNotRevoked = false;
                 boolean anyRevoked = false;
+                boolean anyTimestampPresent = false;
+                boolean anyTimestampValid = false;
 
                 for (PDSignature pdSignature : signatures) {
                     SignatureInfo info = extractBasicSignatureInfo(pdSignature, idx++);
@@ -220,6 +232,26 @@ public class SignatureValidationService {
                         }
                     } else {
                         anyInvalid = true;
+                    }
+
+                    TimestampValidationOutcome timestamp = inspectSignatureTimestamp(contents, info);
+                    if (timestamp.present) {
+                        anyTimestampPresent = true;
+                        out.timestampPresent = true;
+                        if (timestamp.authority != null && (out.timestampAuthority == null || out.timestampAuthority.isBlank())) {
+                            out.timestampAuthority = timestamp.authority;
+                        }
+                        if (timestamp.time != null && (out.timestampTime == null || out.timestampTime.isBlank())) {
+                            out.timestampTime = timestamp.time;
+                        }
+                        if (timestamp.valid) {
+                            anyTimestampValid = true;
+                            out.timestampValid = true;
+                            info.validatorWarnings.add(timestamp.message);
+                        } else {
+                            out.timestampValid = false;
+                            info.validatorWarnings.add(timestamp.message);
+                        }
                     }
 
                     Date validationDate = pdSignature.getSignDate() == null ? new Date() : pdSignature.getSignDate().getTime();
@@ -321,9 +353,17 @@ public class SignatureValidationService {
                 out.postSignatureUpdateAccepted = anyPostSignatureUpdateAccepted;
                 out.signatureIntegrityValid = anyValid && byteRangesWellFormed;
                 out.chainValid = anyChainValid;
+                out.timestampPresent = anyTimestampPresent;
+                if (anyTimestampPresent && !anyTimestampValid && out.timestampValid == null) {
+                    out.timestampValid = false;
+                }
                 out.standard = anyPades ? "PAdES-B" : "Assinatura PDF";
                 if ("dss_lt_upgrade_no_tsa".equals(out.postSignatureUpdateType) || "dss_ltv_update".equals(out.postSignatureUpdateType)) {
                     out.standard = "PAdES-B com DSS";
+                }
+                if (anyTimestampValid) {
+                    out.standard = out.standard != null && out.standard.contains("DSS") ? "PAdES-T com DSS" : "PAdES-T";
+                    out.validationLevel = "pades_t_chain_revocation_validation";
                 }
 
                 if (!byteRangesWellFormed) {
@@ -373,7 +413,11 @@ public class SignatureValidationService {
                     if (!finalDocumentCovered && anyPostSignatureUpdateAccepted) {
                         out.warnings.add("O PDF final contém atualização incremental posterior à assinatura. A atualização foi classificada como técnica permitida: " + safeText(out.postSignatureUpdateType) + ".");
                     }
-                    out.warnings.add("TSA e política de assinatura ainda serão tratados nas próximas etapas.");
+                    if (anyTimestampValid) {
+                        out.warnings.add("Carimbo do tempo de assinatura localizado e validado. A política de assinatura ainda será tratada na próxima etapa.");
+                    } else {
+                        out.warnings.add("TSA não localizada ou não validada. A política de assinatura ainda será tratada na próxima etapa.");
+                    }
                 } else if (anyValid && anyIcp && anyChainValid) {
                     out.result = "valid_icp_brasil_chain_revocation_not_checked";
                     out.valid = null;
@@ -2053,6 +2097,100 @@ public class SignatureValidationService {
         }
     }
 
+
+    private TimestampValidationOutcome inspectSignatureTimestamp(byte[] contents, SignatureInfo info) {
+        TimestampValidationOutcome outcome = new TimestampValidationOutcome();
+        outcome.present = false;
+        outcome.valid = false;
+        outcome.message = "Carimbo do tempo de assinatura não localizado.";
+
+        try {
+            if (contents == null || contents.length == 0) {
+                return outcome;
+            }
+
+            CMSSignedData cms = new CMSSignedData(contents);
+            SignerInformationStore signerStore = cms.getSignerInfos();
+            Collection<SignerInformation> signerInfos = signerStore.getSigners();
+
+            for (SignerInformation signer : signerInfos) {
+                AttributeTable unsignedAttributes = signer.getUnsignedAttributes();
+                if (unsignedAttributes == null) {
+                    continue;
+                }
+
+                Attribute timestampAttribute = unsignedAttributes.get(ID_AA_SIGNATURE_TIMESTAMP_TOKEN);
+                if (timestampAttribute == null || timestampAttribute.getAttrValues() == null || timestampAttribute.getAttrValues().size() == 0) {
+                    continue;
+                }
+
+                outcome.present = true;
+
+                ASN1Encodable value = timestampAttribute.getAttrValues().getObjectAt(0);
+                CMSSignedData timestampCms = new CMSSignedData(value.toASN1Primitive().getEncoded());
+                TimeStampToken token = new TimeStampToken(timestampCms);
+                TimeStampTokenInfo tokenInfo = token.getTimeStampInfo();
+
+                outcome.time = tokenInfo.getGenTime() == null ? null : DATE_FORMAT.format(tokenInfo.getGenTime().toInstant().atZone(ZoneId.systemDefault()));
+
+                String digestAlgorithm = digestNameFromOid(tokenInfo.getMessageImprintAlgOID().getId());
+                MessageDigest digest = MessageDigest.getInstance(digestAlgorithm, BouncyCastleProvider.PROVIDER_NAME);
+                byte[] calculated = digest.digest(signer.getSignature());
+                byte[] declared = tokenInfo.getMessageImprintDigest();
+
+                if (!Arrays.equals(calculated, declared)) {
+                    outcome.valid = false;
+                    outcome.message = "Carimbo do tempo localizado, mas o hash carimbado não corresponde à assinatura.";
+                    return outcome;
+                }
+
+                @SuppressWarnings("unchecked")
+                Store<X509CertificateHolder> timestampCertificates = token.getCertificates();
+                @SuppressWarnings("unchecked")
+                Collection<X509CertificateHolder> matches = timestampCertificates.getMatches(token.getSID());
+                if (matches == null || matches.isEmpty()) {
+                    outcome.valid = false;
+                    outcome.message = "Carimbo do tempo localizado, mas o certificado da autoridade de carimbo não foi encontrado no token.";
+                    return outcome;
+                }
+
+                X509CertificateHolder holder = matches.iterator().next();
+                X509Certificate tsaCertificate = new JcaX509CertificateConverter()
+                        .setProvider(BouncyCastleProvider.PROVIDER_NAME)
+                        .getCertificate(holder);
+
+                token.validate(new JcaSimpleSignerInfoVerifierBuilder()
+                        .setProvider(BouncyCastleProvider.PROVIDER_NAME)
+                        .build(holder));
+
+                outcome.authority = tsaCertificate.getSubjectX500Principal().getName();
+                outcome.valid = true;
+                outcome.message = "Carimbo do tempo de assinatura validado. Autoridade de carimbo: " + outcome.authority
+                        + (outcome.time == null ? "." : ". Data e hora do carimbo: " + outcome.time + ".");
+                return outcome;
+            }
+
+            return outcome;
+        } catch (Exception e) {
+            outcome.present = true;
+            outcome.valid = false;
+            outcome.message = "Carimbo do tempo localizado, mas não validado: " + e.getClass().getSimpleName() + " - " + safeMessage(e instanceof Exception ? (Exception) e : new Exception(e));
+            if (info != null) {
+                info.validatorWarnings.add(outcome.message);
+            }
+            return outcome;
+        }
+    }
+
+    private String digestNameFromOid(String oid) {
+        if ("1.3.14.3.2.26".equals(oid)) return "SHA-1";
+        if ("2.16.840.1.101.3.4.2.1".equals(oid)) return "SHA-256";
+        if ("2.16.840.1.101.3.4.2.2".equals(oid)) return "SHA-384";
+        if ("2.16.840.1.101.3.4.2.3".equals(oid)) return "SHA-512";
+        if ("2.16.840.1.101.3.4.2.4".equals(oid)) return "SHA-224";
+        return oid;
+    }
+
     private void readDemoiselleSignatureInformation(Object signatureInformation, SignatureInfo info) {
         if (signatureInformation == null) {
             return;
@@ -2126,6 +2264,14 @@ public class SignatureValidationService {
         int nonWhitespaceBytes;
         int printableBytes;
         int controlOrBinaryBytes;
+    }
+
+    private static class TimestampValidationOutcome {
+        boolean present;
+        boolean valid;
+        String authority;
+        String time;
+        String message;
     }
 
     private static class DemoiselleOutcome {
