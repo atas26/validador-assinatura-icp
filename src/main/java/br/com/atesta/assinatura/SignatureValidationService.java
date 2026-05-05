@@ -1169,11 +1169,11 @@ public class SignatureValidationService {
             info.certificateIssuer = cert.getIssuerX500Principal().getName();
             info.certificateNotBefore = DATE_FORMAT.format(cert.getNotBefore().toInstant().atZone(ZoneId.systemDefault()));
             info.certificateNotAfter = DATE_FORMAT.format(cert.getNotAfter().toInstant().atZone(ZoneId.systemDefault()));
-            info.certificateSerialNumber = formatCertificateSerialNumber(certificate);
-info.certificateSerialNumberHex = certificate.getSerialNumber() == null
-        ? null
-        : certificate.getSerialNumber().toString(16).toUpperCase(java.util.Locale.ROOT);
-info.certificateIssuerName = certificate.getIssuerX500Principal().getName();
+            info.certificateSerialNumber = formatCertificateSerialNumber(cert);
+            info.certificateSerialNumberHex = cert.getSerialNumber() == null
+                    ? null
+                    : cert.getSerialNumber().toString(16).toUpperCase(java.util.Locale.ROOT);
+            info.certificateIssuerName = cert.getIssuerX500Principal().getName();
 
             if (looksLikeIcpBrasil(cert)) {
                 info.icpBrasil = true;
