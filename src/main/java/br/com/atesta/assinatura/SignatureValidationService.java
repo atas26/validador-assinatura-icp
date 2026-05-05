@@ -2572,4 +2572,19 @@ info.certificateIssuerName = certificate.getIssuerX500Principal().getName();
         String message;
         List<String> chainPath = new ArrayList<>();
     }
+    private String formatCertificateSerialNumber(X509Certificate certificate) {
+    if (certificate == null || certificate.getSerialNumber() == null) {
+        return null;
+    }
+
+    String hex = certificate.getSerialNumber()
+            .toString(16)
+            .toUpperCase(java.util.Locale.ROOT);
+
+    if (hex.length() % 2 != 0) {
+        hex = "0" + hex;
+    }
+
+    return hex.replaceAll("(.{2})(?=.)", "$1:");
+}
 }
