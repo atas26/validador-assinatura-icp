@@ -509,7 +509,7 @@ public class SignatureValidationService {
             return true;
         }
 
-        return isOnlyTrailingPaddingAfterSignedRevision(sig, pdfLength, null);
+        return false;
     }
 
     private PostSignatureUpdateAnalysis analyzePostSignatureUpdate(PDSignature sig, byte[] pdf) {
@@ -587,6 +587,19 @@ public class SignatureValidationService {
         boolean hasActionRisk = containsAny(compact, "/OpenAction", "/AA", "/JavaScript", "/JS", "/Launch", "/EmbeddedFile", "/RichMedia");
         boolean hasCatalogOrInfoRisk = containsAny(compact, "/Catalog", "/Root", "/Info", "/Metadata");
         boolean hasMaterialRisk = hasPageContentRisk || hasTextDrawingRisk || hasPageTreeRisk || hasActionRisk;
+        boolean hasAnyPdfStructureMarker = hasXrefKeyword
+                || hasTrailerKeyword
+                || hasStartXref
+                || hasEof
+                || hasObjectDeclaration
+                || hasXrefStream
+                || hasStream
+                || hasDss
+                || hasDocTimeStamp
+                || hasAdditionalSignature
+                || hasCatalogOrInfoRisk;
+
+        TrailingBytesProfile trailingProfile = profileTrailingBytes(pdf, offset, length);
 
         String diagnostic = " Diagnóstico da atualização posterior: bytes=" + remaining
                 + "; xref=" + hasXrefKeyword
@@ -600,6 +613,9 @@ public class SignatureValidationService {
                 + "; docTimeStamp=" + hasDocTimeStamp
                 + "; assinaturaAdicional=" + hasAdditionalSignature
                 + "; riscoConteudo=" + hasMaterialRisk
+                + "; bytesNaoBrancos=" + trailingProfile.nonWhitespaceBytes
+                + "; bytesImprimiveis=" + trailingProfile.printableBytes
+                + "; bytesControleOuBinarios=" + trailingProfile.controlOrBinaryBytes
                 + ".";
 
         boolean xrefTrailerOnly = hasXrefKeyword
@@ -622,30 +638,44 @@ public class SignatureValidationService {
                 && !hasDocTimeStamp
                 && !hasAdditionalSignature;
 
+        boolean smallUnreferencedTrailingBytes = remaining <= 2048
+                && !hasAnyPdfStructureMarker
+                && !hasMaterialRisk
+                && trailingProfile.nonWhitespaceBytes > 0
+                && trailingProfile.printableBytes == 0;
+
         /*
-         * PDFs podem receber uma pequena atualização incremental estrutural após a assinatura.
-         * Essa atualização normalmente contém xref/trailer/startxref/EOF, ou uma variação em xref stream.
-         * A aceitação abaixo é deliberadamente restrita: só permite quando não há sinais de página,
-         * conteúdo visual, anotação, ação, JavaScript, anexo, recurso de página ou nova assinatura.
+         * PDFs podem receber pequena sobra de bytes após a revisão assinada.
+         * Quando esses bytes não trazem marcadores de estrutura PDF, objeto, stream,
+         * página, recurso, assinatura, DSS/LTV, JavaScript, anexo ou texto imprimível,
+         * o trecho é classificado como sobra binária não referenciada pelo PDF.
+         * A aceitação abaixo é restrita a trechos pequenos, sem sinal de conteúdo material.
          */
         if (xrefTrailerOnly) {
             analysis.accepted = true;
             analysis.type = "xref_trailer_only_update";
-            analysis.message = "Atualização posterior classificada como atualização estrutural de xref/trailer, sem indício de alteração de conteúdo." + diagnostic;
+            analysis.message = "Atualização posterior classificada como atualização estrutural de xref/trailer, sem sinal de alteração de conteúdo." + diagnostic;
             return analysis;
         }
 
         if (xrefStreamOnly) {
             analysis.accepted = true;
             analysis.type = "xref_stream_only_update";
-            analysis.message = "Atualização posterior classificada como atualização estrutural de xref stream, sem indício de alteração de conteúdo." + diagnostic;
+            analysis.message = "Atualização posterior classificada como atualização estrutural de xref stream, sem sinal de alteração de conteúdo." + diagnostic;
             return analysis;
         }
 
         if (smallStructuralUpdate) {
             analysis.accepted = true;
             analysis.type = "small_structural_incremental_update";
-            analysis.message = "Atualização posterior pequena classificada como atualização estrutural, sem indício de alteração de conteúdo material." + diagnostic;
+            analysis.message = "Atualização posterior pequena classificada como atualização estrutural, sem sinal de alteração de conteúdo material." + diagnostic;
+            return analysis;
+        }
+
+        if (smallUnreferencedTrailingBytes) {
+            analysis.accepted = true;
+            analysis.type = "small_unreferenced_trailing_bytes";
+            analysis.message = "Trecho posterior pequeno classificado como bytes finais não referenciados pela estrutura PDF, sem marcadores de objeto, stream, página, assinatura, DSS/LTV, ação, anexo ou conteúdo textual imprimível." + diagnostic;
             return analysis;
         }
 
@@ -665,9 +695,32 @@ public class SignatureValidationService {
         }
 
         analysis.type = "unknown_incremental_update";
-        analysis.message = "Foi detectada atualização incremental posterior à revisão assinada, mas ela não foi classificada como atualização estrutural, DSS/LTV, carimbo do tempo ou assinatura adicional sem indícios de alteração de conteúdo." + diagnostic
+        analysis.message = "Foi detectada atualização incremental posterior à revisão assinada, mas ela não foi classificada como atualização estrutural, DSS/LTV, carimbo do tempo ou assinatura adicional sem sinals de alteração de conteúdo." + diagnostic
                 + (hasCatalogOrInfoRisk && !hasMaterialRisk ? " Foram encontrados marcadores de catálogo, raiz, informações ou metadados. A ferramenta não aceita automaticamente esse caso sem análise técnica complementar." : "");
         return analysis;
+    }
+
+    private TrailingBytesProfile profileTrailingBytes(byte[] pdf, int offset, int length) {
+        TrailingBytesProfile profile = new TrailingBytesProfile();
+
+        if (pdf == null || offset < 0 || length < 0 || offset + length > pdf.length) {
+            return profile;
+        }
+
+        for (int i = offset; i < offset + length; i++) {
+            int value = pdf[i] & 0xFF;
+            boolean whitespace = value == 0x00 || value == 0x09 || value == 0x0A || value == 0x0C || value == 0x0D || value == 0x20;
+            if (!whitespace) {
+                profile.nonWhitespaceBytes++;
+            }
+            if (value >= 0x21 && value <= 0x7E) {
+                profile.printableBytes++;
+            } else if (!whitespace) {
+                profile.controlOrBinaryBytes++;
+            }
+        }
+
+        return profile;
     }
 
     private boolean containsPdfObjectDeclaration(String text) {
@@ -1437,6 +1490,12 @@ public class SignatureValidationService {
         String type;
         Long bytes;
         String message;
+    }
+
+    private static class TrailingBytesProfile {
+        int nonWhitespaceBytes;
+        int printableBytes;
+        int controlOrBinaryBytes;
     }
 
     private static class DemoiselleOutcome {
