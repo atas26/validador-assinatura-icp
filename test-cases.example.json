@@ -1,0 +1,66 @@
+{
+  "tests": [
+    {
+      "name": "PAdES-B com DSS, ICP-Brasil, OCSP good, sem TSA",
+      "file": "pades-b-com-dss-sem-tsa.pdf",
+      "expectedResultOneOf": [
+        "valid_icp_brasil_chain_crl_with_permitted_incremental_update"
+      ],
+      "expectedValid": true,
+      "expectedIcpBrasil": true,
+      "expectedChainValid": true,
+      "expectedRevocationChecked": true,
+      "expectedRevoked": false,
+      "expectedRevocationMethodOneOf": ["OCSP", "CRL"],
+      "expectedStandardOneOf": ["PAdES-B com DSS"],
+      "expectedFinalDocumentAcceptable": true,
+      "expectedPostSignatureUpdateTypeOneOf": ["dss_lt_upgrade_no_tsa"],
+      "expectedTimestampPresent": false,
+      "expectedPolicyDeclared": false
+    },
+    {
+      "name": "PDF sem assinatura",
+      "file": "01-sem-assinatura.pdf",
+      "expectedResultOneOf": [
+        "not_signed",
+        "no_signature",
+        "signature_not_found",
+        "unsigned_pdf"
+      ],
+      "expectedValid": false,
+      "expectedIcpBrasil": false
+    },
+    {
+      "name": "Certificado expirado na data da validação, mas assinado dentro da vigência",
+      "file": "certificado-expirado-assinado-na-vigencia.pdf",
+      "expectedResultOneOf": [
+        "valid_icp_brasil_chain_crl_with_permitted_incremental_update",
+        "signature_valid_but_pdf_not_fully_covered",
+        "valid_icp_brasil",
+        "signature_valid"
+      ],
+      "expectedIcpBrasil": true,
+      "expectedChainValid": true,
+      "expectedRevocationChecked": true,
+      "expectedRevoked": false,
+      "expectedRevocationMethodOneOf": ["OCSP", "CRL"]
+    },
+    {
+      "name": "Assinatura válida na revisão assinada, mas PDF final não aceito automaticamente",
+      "file": "matricula-pdf-final-nao-aceito.pdf",
+      "expectedResultOneOf": [
+        "signature_valid_but_pdf_not_fully_covered"
+      ],
+      "expectedValid": false,
+      "expectedIcpBrasil": true,
+      "expectedChainValid": true,
+      "expectedRevocationChecked": true,
+      "expectedRevoked": false,
+      "expectedRevocationMethodOneOf": ["OCSP", "CRL"],
+      "expectedFinalDocumentAcceptable": false,
+      "expectedPostSignatureUpdateTypeOneOf": [
+        "unknown_incremental_update"
+      ]
+    }
+  ]
+}
