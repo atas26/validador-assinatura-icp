@@ -540,6 +540,8 @@ public class SignatureValidationService {
 
         if (remaining <= 0) {
             analysis.accepted = true;
+            analysis.type = "fully_covered";
+            analysis.message = "O ByteRange cobre o arquivo PDF final.";
             return analysis;
         }
 
@@ -571,52 +573,100 @@ public class SignatureValidationService {
                 && containsAny(compact, "/ByteRange")
                 && containsAny(compact, "/Contents");
 
-        boolean hasXrefTrailerOnly = containsAny(compact, "xref")
-                && containsAny(compact, "trailer")
-                && containsAny(compact, "startxref")
-                && containsAny(compact, "%%EOF")
-                && !containsPdfObjectDeclaration(compact);
-
-        boolean hasXrefStreamOnly = containsAny(compact, "/Type/XRef", "/Type /XRef")
-                && containsAny(compact, "startxref")
-                && containsAny(compact, "%%EOF")
-                && !containsAny(compact, "/Page", "/Pages", "/Contents", "/XObject", "/Font", "/Annots", "/AcroForm");
+        boolean hasXrefKeyword = containsAny(compact, "xref");
+        boolean hasTrailerKeyword = containsAny(compact, "trailer");
+        boolean hasStartXref = containsAny(compact, "startxref");
+        boolean hasEof = containsAny(compact, "%%EOF");
+        boolean hasObjectDeclaration = containsPdfObjectDeclaration(compact);
+        boolean hasXrefStream = containsAny(compact, "/Type/XRef", "/Type /XRef");
+        boolean hasStream = containsAny(compact, "stream", "endstream");
 
         boolean hasPageContentRisk = containsAny(compact, "/Subtype/Image", "/XObject", "/Font", "/MediaBox", "/CropBox", "/Rotate");
         boolean hasTextDrawingRisk = containsAny(compact, " BT", " ET", " Tj", " TJ", " Do");
         boolean hasPageTreeRisk = containsAny(compact, "/Page", "/Pages", "/Annots", "/AcroForm", "/Resources");
+        boolean hasActionRisk = containsAny(compact, "/OpenAction", "/AA", "/JavaScript", "/JS", "/Launch", "/EmbeddedFile", "/RichMedia");
+        boolean hasCatalogOrInfoRisk = containsAny(compact, "/Catalog", "/Root", "/Info", "/Metadata");
+        boolean hasMaterialRisk = hasPageContentRisk || hasTextDrawingRisk || hasPageTreeRisk || hasActionRisk;
 
-        if (hasXrefTrailerOnly) {
+        String diagnostic = " Diagnóstico da atualização posterior: bytes=" + remaining
+                + "; xref=" + hasXrefKeyword
+                + "; trailer=" + hasTrailerKeyword
+                + "; startxref=" + hasStartXref
+                + "; eof=" + hasEof
+                + "; obj=" + hasObjectDeclaration
+                + "; xrefStream=" + hasXrefStream
+                + "; stream=" + hasStream
+                + "; dss=" + hasDss
+                + "; docTimeStamp=" + hasDocTimeStamp
+                + "; assinaturaAdicional=" + hasAdditionalSignature
+                + "; riscoConteudo=" + hasMaterialRisk
+                + ".";
+
+        boolean xrefTrailerOnly = hasXrefKeyword
+                && hasTrailerKeyword
+                && hasStartXref
+                && hasEof
+                && !hasObjectDeclaration
+                && !hasMaterialRisk;
+
+        boolean xrefStreamOnly = hasXrefStream
+                && hasStartXref
+                && hasEof
+                && !hasMaterialRisk;
+
+        boolean smallStructuralUpdate = remaining <= 2048
+                && hasStartXref
+                && hasEof
+                && !hasMaterialRisk
+                && !hasDss
+                && !hasDocTimeStamp
+                && !hasAdditionalSignature;
+
+        /*
+         * PDFs podem receber uma pequena atualização incremental estrutural após a assinatura.
+         * Essa atualização normalmente contém xref/trailer/startxref/EOF, ou uma variação em xref stream.
+         * A aceitação abaixo é deliberadamente restrita: só permite quando não há sinais de página,
+         * conteúdo visual, anotação, ação, JavaScript, anexo, recurso de página ou nova assinatura.
+         */
+        if (xrefTrailerOnly) {
             analysis.accepted = true;
             analysis.type = "xref_trailer_only_update";
-            analysis.message = "Atualização posterior classificada como atualização estrutural de xref/trailer, sem objeto PDF novo e sem indício de alteração de conteúdo.";
+            analysis.message = "Atualização posterior classificada como atualização estrutural de xref/trailer, sem indício de alteração de conteúdo." + diagnostic;
             return analysis;
         }
 
-        if (hasXrefStreamOnly) {
+        if (xrefStreamOnly) {
             analysis.accepted = true;
             analysis.type = "xref_stream_only_update";
-            analysis.message = "Atualização posterior classificada como atualização estrutural de xref stream, sem indício de alteração de conteúdo.";
+            analysis.message = "Atualização posterior classificada como atualização estrutural de xref stream, sem indício de alteração de conteúdo." + diagnostic;
             return analysis;
         }
 
-        if ((hasDss || hasDocTimeStamp || hasAdditionalSignature) && !hasPageContentRisk && !hasTextDrawingRisk && !hasPageTreeRisk) {
+        if (smallStructuralUpdate) {
+            analysis.accepted = true;
+            analysis.type = "small_structural_incremental_update";
+            analysis.message = "Atualização posterior pequena classificada como atualização estrutural, sem indício de alteração de conteúdo material." + diagnostic;
+            return analysis;
+        }
+
+        if ((hasDss || hasDocTimeStamp || hasAdditionalSignature) && !hasMaterialRisk) {
             analysis.accepted = true;
             if (hasDocTimeStamp) {
                 analysis.type = "document_timestamp_update";
-                analysis.message = "Atualização incremental posterior classificada como carimbo do tempo documental ou material técnico correlato.";
+                analysis.message = "Atualização incremental posterior classificada como carimbo do tempo documental ou material técnico correlato." + diagnostic;
             } else if (hasDss) {
                 analysis.type = "dss_ltv_update";
-                analysis.message = "Atualização incremental posterior classificada como inclusão de dados de validação DSS/LTV.";
+                analysis.message = "Atualização incremental posterior classificada como inclusão de dados de validação DSS/LTV." + diagnostic;
             } else {
                 analysis.type = "additional_signature_update";
-                analysis.message = "Atualização incremental posterior classificada como acréscimo de assinatura digital adicional.";
+                analysis.message = "Atualização incremental posterior classificada como acréscimo de assinatura digital adicional." + diagnostic;
             }
             return analysis;
         }
 
         analysis.type = "unknown_incremental_update";
-        analysis.message = "Foi detectada atualização incremental posterior à revisão assinada, mas ela não foi classificada como atualização estrutural, DSS/LTV, carimbo do tempo ou assinatura adicional sem indícios de alteração de conteúdo.";
+        analysis.message = "Foi detectada atualização incremental posterior à revisão assinada, mas ela não foi classificada como atualização estrutural, DSS/LTV, carimbo do tempo ou assinatura adicional sem indícios de alteração de conteúdo." + diagnostic
+                + (hasCatalogOrInfoRisk && !hasMaterialRisk ? " Foram encontrados marcadores de catálogo, raiz, informações ou metadados. A ferramenta não aceita automaticamente esse caso sem análise técnica complementar." : "");
         return analysis;
     }
 
