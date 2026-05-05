@@ -44,6 +44,7 @@ import org.bouncycastle.asn1.ASN1ObjectIdentifier;
 import org.bouncycastle.asn1.ASN1OctetString;
 import org.bouncycastle.asn1.cms.Attribute;
 import org.bouncycastle.asn1.cms.AttributeTable;
+import org.bouncycastle.asn1.esf.SignaturePolicyIdentifier;
 import org.bouncycastle.asn1.DERIA5String;
 import org.bouncycastle.asn1.x509.AccessDescription;
 import org.bouncycastle.asn1.x509.AuthorityInformationAccess;
@@ -104,6 +105,7 @@ public class SignatureValidationService {
      */
     private static final String TRUST_ANCHOR_RESOURCE_DIR = "icp-brasil/trust-anchors/";
     private static final ASN1ObjectIdentifier ID_AA_SIGNATURE_TIMESTAMP_TOKEN = new ASN1ObjectIdentifier("1.2.840.113549.1.9.16.2.14");
+    private static final ASN1ObjectIdentifier ID_AA_ETS_SIG_POLICY_ID = new ASN1ObjectIdentifier("1.2.840.113549.1.9.16.2.15");
 
     static {
         if (Security.getProvider(BouncyCastleProvider.PROVIDER_NAME) == null) {
@@ -169,6 +171,8 @@ public class SignatureValidationService {
                 boolean anyRevoked = false;
                 boolean anyTimestampPresent = false;
                 boolean anyTimestampValid = false;
+                boolean anyPolicyDeclared = false;
+                boolean anyPolicyRecognized = false;
 
                 for (PDSignature pdSignature : signatures) {
                     SignatureInfo info = extractBasicSignatureInfo(pdSignature, idx++);
@@ -252,6 +256,23 @@ public class SignatureValidationService {
                             out.timestampValid = false;
                             info.validatorWarnings.add(timestamp.message);
                         }
+                    }
+
+                    PolicyValidationOutcome policy = inspectSignaturePolicy(contents, info);
+                    if (policy.declared) {
+                        anyPolicyDeclared = true;
+                        if (policy.recognized) {
+                            anyPolicyRecognized = true;
+                        }
+                        if (out.policyOid == null || out.policyOid.isBlank()) {
+                            out.policyOid = policy.oid;
+                        }
+                        if (out.policyName == null || out.policyName.isBlank()) {
+                            out.policyName = policy.name;
+                        }
+                        info.validatorWarnings.add(policy.message);
+                    } else if (policy.message != null && !policy.message.isBlank()) {
+                        info.validatorWarnings.add(policy.message);
                     }
 
                     Date validationDate = pdSignature.getSignDate() == null ? new Date() : pdSignature.getSignDate().getTime();
@@ -357,6 +378,8 @@ public class SignatureValidationService {
                 if (anyTimestampPresent && !anyTimestampValid && out.timestampValid == null) {
                     out.timestampValid = false;
                 }
+                out.policyDeclared = anyPolicyDeclared;
+                out.policyRecognized = anyPolicyRecognized;
                 out.standard = anyPades ? "PAdES-B" : "Assinatura PDF";
                 if ("dss_lt_upgrade_no_tsa".equals(out.postSignatureUpdateType) || "dss_ltv_update".equals(out.postSignatureUpdateType)) {
                     out.standard = "PAdES-B com DSS";
@@ -414,9 +437,15 @@ public class SignatureValidationService {
                         out.warnings.add("O PDF final contém atualização incremental posterior à assinatura. A atualização foi classificada como técnica permitida: " + safeText(out.postSignatureUpdateType) + ".");
                     }
                     if (anyTimestampValid) {
-                        out.warnings.add("Carimbo do tempo de assinatura localizado e validado. A política de assinatura ainda será tratada na próxima etapa.");
+                        out.warnings.add("Carimbo do tempo de assinatura localizado e validado.");
                     } else {
-                        out.warnings.add("TSA não localizada ou não validada. A política de assinatura ainda será tratada na próxima etapa.");
+                        out.warnings.add("TSA não localizada ou não validada. A classificação permanece como " + safeText(out.standard) + ".");
+                    }
+
+                    if (anyPolicyDeclared) {
+                        out.warnings.add("Política de assinatura declarada no pacote assinado: " + safeText(out.policyName) + (out.policyOid == null ? "." : " (OID " + out.policyOid + ")."));
+                    } else {
+                        out.warnings.add("Política de assinatura ICP-Brasil tipificada não declarada no pacote assinado.");
                     }
                 } else if (anyValid && anyIcp && anyChainValid) {
                     out.result = "valid_icp_brasil_chain_revocation_not_checked";
@@ -438,7 +467,7 @@ public class SignatureValidationService {
                     out.valid = true;
                     out.icpBrasil = false;
                     out.message = "Assinatura validada, mas a identificação como certificado ICP-Brasil não foi confirmada automaticamente.";
-                    out.warnings.add("Cadeia integral, revogação por LCR ou OCSP, TSA e política de assinatura ainda não foram concluídas.");
+                    out.warnings.add("Cadeia integral, revogação por LCR ou OCSP e TSA devem ser concluídas para validação plena. Política de assinatura será informada quando declarada no pacote assinado.");
                 } else if (anyInvalid && allChecked) {
                     out.result = "invalid_signature";
                     out.valid = false;
@@ -509,6 +538,8 @@ public class SignatureValidationService {
 
         out.policyOid = null;
         out.policyName = null;
+        out.policyDeclared = false;
+        out.policyRecognized = false;
     }
 
     private SignatureInfo extractBasicSignatureInfo(PDSignature sig, int index) {
@@ -1513,7 +1544,7 @@ public class SignatureValidationService {
             return result;
         }
 
-        result.responder = String.valueOf(basicResponse.getResponderId());
+        result.responder = "Resposta OCSP validada";
         result.producedAt = basicResponse.getProducedAt() == null ? null : DATE_FORMAT.format(basicResponse.getProducedAt().toInstant().atZone(ZoneId.systemDefault()));
 
         if (!isOcspResponseSignatureValid(basicResponse, issuerCertificate)) {
@@ -2098,6 +2129,140 @@ public class SignatureValidationService {
     }
 
 
+
+    private PolicyValidationOutcome inspectSignaturePolicy(byte[] contents, SignatureInfo info) {
+        PolicyValidationOutcome outcome = new PolicyValidationOutcome();
+        outcome.declared = false;
+        outcome.recognized = false;
+        outcome.message = "Política de assinatura ICP-Brasil tipificada não declarada no pacote assinado.";
+
+        try {
+            if (contents == null || contents.length == 0) {
+                return outcome;
+            }
+
+            CMSSignedData cms = new CMSSignedData(contents);
+            SignerInformationStore signerStore = cms.getSignerInfos();
+            Collection<SignerInformation> signerInfos = signerStore.getSigners();
+
+            for (SignerInformation signer : signerInfos) {
+                AttributeTable signedAttributes = signer.getSignedAttributes();
+                if (signedAttributes == null) {
+                    continue;
+                }
+
+                Attribute policyAttribute = signedAttributes.get(ID_AA_ETS_SIG_POLICY_ID);
+                if (policyAttribute == null || policyAttribute.getAttrValues() == null || policyAttribute.getAttrValues().size() == 0) {
+                    continue;
+                }
+
+                outcome.declared = true;
+
+                ASN1Encodable value = policyAttribute.getAttrValues().getObjectAt(0);
+                String oid = extractSignaturePolicyOid(value);
+
+                if (oid == null || oid.isBlank()) {
+                    outcome.oid = null;
+                    outcome.name = "Política de assinatura declarada, mas o OID não foi extraído";
+                    outcome.recognized = false;
+                    outcome.message = "Política de assinatura declarada no pacote assinado, mas o OID não foi extraído automaticamente.";
+                    return outcome;
+                }
+
+                outcome.oid = oid;
+                outcome.name = mapSignaturePolicyName(oid);
+                outcome.recognized = oid.startsWith("2.16.76.1.7.1.");
+                outcome.message = outcome.recognized
+                        ? "Política de assinatura ICP-Brasil declarada no pacote assinado: " + outcome.name + " (OID " + oid + ")."
+                        : "Política de assinatura declarada no pacote assinado, fora do arco ICP-Brasil conhecido: OID " + oid + ".";
+                return outcome;
+            }
+
+            return outcome;
+        } catch (Exception e) {
+            outcome.declared = false;
+            outcome.recognized = false;
+            outcome.message = "Não foi possível verificar a política de assinatura: " + e.getClass().getSimpleName() + " - " + safeMessage(e);
+            if (info != null) {
+                info.validatorWarnings.add(outcome.message);
+            }
+            return outcome;
+        }
+    }
+
+    private String extractSignaturePolicyOid(ASN1Encodable value) {
+        if (value == null) {
+            return null;
+        }
+
+        try {
+            SignaturePolicyIdentifier identifier = SignaturePolicyIdentifier.getInstance(value);
+            if (identifier == null || identifier.isSignaturePolicyImplied()) {
+                return "implied";
+            }
+            if (identifier.getSignaturePolicyId() != null && identifier.getSignaturePolicyId().getSigPolicyId() != null) {
+                return identifier.getSignaturePolicyId().getSigPolicyId().getId();
+            }
+        } catch (Exception ignored) {
+            // fallback textual abaixo
+        }
+
+        String text = String.valueOf(value);
+        Matcher matcher = Pattern.compile("2\\.16\\.76\\.1\\.7\\.1\\.[0-9]+(?:\\.[0-9]+)*").matcher(text);
+        if (matcher.find()) {
+            return matcher.group();
+        }
+
+        matcher = Pattern.compile("[0-9]+(?:\\.[0-9]+){4,}").matcher(text);
+        if (matcher.find()) {
+            return matcher.group();
+        }
+
+        return null;
+    }
+
+    private String mapSignaturePolicyName(String oid) {
+        if (oid == null || oid.isBlank()) {
+            return null;
+        }
+
+        if ("implied".equals(oid)) {
+            return "Política de assinatura implícita";
+        }
+
+        if (!oid.startsWith("2.16.76.1.7.1.")) {
+            return "Política de assinatura declarada fora do arco ICP-Brasil conhecido";
+        }
+
+        String suffix = oid.substring("2.16.76.1.7.1.".length());
+        String family = suffix.split("\\.")[0];
+
+        switch (family) {
+            case "1":
+                return "Política ICP-Brasil AD-RB baseada em CAdES";
+            case "2":
+                return "Política ICP-Brasil AD-RT baseada em CAdES";
+            case "3":
+                return "Política ICP-Brasil AD-RV baseada em CAdES";
+            case "4":
+                return "Política ICP-Brasil AD-RC baseada em CAdES";
+            case "5":
+                return "Política ICP-Brasil AD-RA baseada em CAdES";
+            case "10":
+                return "Política ICP-Brasil para assinatura no formato PAdES";
+            case "11":
+                return "Política ICP-Brasil para assinatura PAdES";
+            case "12":
+                return "Política ICP-Brasil para assinatura PAdES";
+            case "13":
+                return "Política ICP-Brasil para assinatura PAdES";
+            case "14":
+                return "Política ICP-Brasil para assinatura PAdES com referências para arquivamento";
+            default:
+                return "Política de assinatura ICP-Brasil declarada";
+        }
+    }
+
     private TimestampValidationOutcome inspectSignatureTimestamp(byte[] contents, SignatureInfo info) {
         TimestampValidationOutcome outcome = new TimestampValidationOutcome();
         outcome.present = false;
@@ -2264,6 +2429,14 @@ public class SignatureValidationService {
         int nonWhitespaceBytes;
         int printableBytes;
         int controlOrBinaryBytes;
+    }
+
+    private static class PolicyValidationOutcome {
+        boolean declared;
+        boolean recognized;
+        String oid;
+        String name;
+        String message;
     }
 
     private static class TimestampValidationOutcome {
