@@ -4,6 +4,7 @@ import java.io.ByteArrayInputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URI;
 import java.net.URL;
@@ -46,6 +47,23 @@ import org.bouncycastle.asn1.x509.DistributionPointName;
 import org.bouncycastle.asn1.x509.Extension;
 import org.bouncycastle.asn1.x509.GeneralName;
 import org.bouncycastle.asn1.x509.GeneralNames;
+import org.bouncycastle.asn1.x509.KeyPurposeId;
+import org.bouncycastle.cert.X509CertificateHolder;
+import org.bouncycastle.cert.jcajce.JcaX509CertificateConverter;
+import org.bouncycastle.cert.jcajce.JcaX509CertificateHolder;
+import org.bouncycastle.cert.ocsp.BasicOCSPResp;
+import org.bouncycastle.cert.ocsp.CertificateID;
+import org.bouncycastle.cert.ocsp.CertificateStatus;
+import org.bouncycastle.cert.ocsp.OCSPReq;
+import org.bouncycastle.cert.ocsp.OCSPReqBuilder;
+import org.bouncycastle.cert.ocsp.OCSPResp;
+import org.bouncycastle.cert.ocsp.RevokedStatus;
+import org.bouncycastle.cert.ocsp.SingleResp;
+import org.bouncycastle.cert.ocsp.UnknownStatus;
+import org.bouncycastle.operator.ContentVerifierProvider;
+import org.bouncycastle.operator.DigestCalculatorProvider;
+import org.bouncycastle.operator.jcajce.JcaContentVerifierProviderBuilder;
+import org.bouncycastle.operator.jcajce.JcaDigestCalculatorProviderBuilder;
 import org.bouncycastle.cms.CMSSignedData;
 import org.bouncycastle.cms.SignerInformation;
 import org.bouncycastle.cms.SignerInformationStore;
@@ -235,12 +253,31 @@ public class SignatureValidationService {
                         }
                     }
 
-                    RevocationOutcome revocation = checkRevocationByCrl(contents);
+                    RevocationOutcome revocation = checkRevocationByOcspThenCrl(contents);
 
                     if (revocation.checked) {
                         anyRevocationChecked = true;
                         out.revocationChecked = true;
-                        out.revocationMethod = "CRL";
+                        out.revocationMethod = revocation.method == null || revocation.method.isBlank() ? "CRL" : revocation.method;
+
+                        if (out.ocspUrl == null || out.ocspUrl.isBlank()) {
+                            out.ocspUrl = revocation.ocspUrl;
+                        }
+                        if (out.ocspStatus == null || out.ocspStatus.isBlank()) {
+                            out.ocspStatus = revocation.ocspStatus;
+                        }
+                        if (out.ocspResponder == null || out.ocspResponder.isBlank()) {
+                            out.ocspResponder = revocation.ocspResponder;
+                        }
+                        if (out.ocspProducedAt == null || out.ocspProducedAt.isBlank()) {
+                            out.ocspProducedAt = revocation.ocspProducedAt;
+                        }
+                        if (out.ocspThisUpdate == null || out.ocspThisUpdate.isBlank()) {
+                            out.ocspThisUpdate = revocation.ocspThisUpdate;
+                        }
+                        if (out.ocspNextUpdate == null || out.ocspNextUpdate.isBlank()) {
+                            out.ocspNextUpdate = revocation.ocspNextUpdate;
+                        }
 
                         if (out.crlUrl == null || out.crlUrl.isBlank()) {
                             out.crlUrl = revocation.crlUrl;
@@ -331,18 +368,18 @@ public class SignatureValidationService {
                     out.revocationChecked = true;
                     out.revoked = false;
                     out.message = finalDocumentCovered
-                            ? "Assinatura PAdES-B validada. Certificado ICP-Brasil identificado. Cadeia de certificação validada até âncora confiável da ICP-Brasil. Consulta de revogação por LCR realizada sem identificação de revogação."
-                            : "Assinatura PAdES-B validada sobre a revisão assinada. Certificado ICP-Brasil identificado. Cadeia validada até âncora confiável da ICP-Brasil. Consulta de revogação por LCR realizada sem identificação de revogação. A atualização incremental posterior foi classificada como técnica permitida.";
+                            ? "Assinatura PAdES-B validada. Certificado ICP-Brasil identificado. Cadeia de certificação validada até âncora confiável da ICP-Brasil. Consulta de revogação realizada sem identificação de revogação."
+                            : "Assinatura PAdES-B validada sobre a revisão assinada. Certificado ICP-Brasil identificado. Cadeia validada até âncora confiável da ICP-Brasil. Consulta de revogação realizada sem identificação de revogação. A atualização incremental posterior foi classificada como técnica permitida.";
                     if (!finalDocumentCovered && anyPostSignatureUpdateAccepted) {
                         out.warnings.add("O PDF final contém atualização incremental posterior à assinatura. A atualização foi classificada como técnica permitida: " + safeText(out.postSignatureUpdateType) + ".");
                     }
-                    out.warnings.add("OCSP, TSA e política de assinatura ainda serão tratados nas próximas etapas.");
+                    out.warnings.add("TSA e política de assinatura ainda serão tratados nas próximas etapas.");
                 } else if (anyValid && anyIcp && anyChainValid) {
                     out.result = "valid_icp_brasil_chain_revocation_not_checked";
                     out.valid = null;
                     out.icpBrasil = true;
                     out.revocationChecked = false;
-                    out.message = "Assinatura PAdES-B validada e cadeia ICP-Brasil reconhecida, mas a consulta de revogação por LCR não foi concluída.";
+                    out.message = "Assinatura PAdES-B validada e cadeia ICP-Brasil reconhecida, mas a consulta de revogação por OCSP ou LCR não foi concluída.";
                     out.warnings.add("Sem consulta de revogação, o resultado não deve ser tratado como conformidade plena da assinatura.");
                 } else if (anyValid && anyIcp && !anyChainValid) {
                     out.result = anyChainChecked ? "signature_valid_chain_invalid" : "signature_valid_chain_not_checked";
@@ -415,6 +452,11 @@ public class SignatureValidationService {
         out.revocationDate = null;
         out.revocationReason = null;
         out.ocspUrl = null;
+        out.ocspStatus = null;
+        out.ocspResponder = null;
+        out.ocspProducedAt = null;
+        out.ocspThisUpdate = null;
+        out.ocspNextUpdate = null;
 
         out.timestampPresent = false;
         out.timestampValid = null;
@@ -1283,6 +1325,345 @@ public class SignatureValidationService {
     }
 
 
+
+    private RevocationOutcome checkRevocationByOcspThenCrl(byte[] contents) {
+        RevocationOutcome ocsp = checkRevocationByOcsp(contents);
+
+        if (ocsp.checked) {
+            return ocsp;
+        }
+
+        RevocationOutcome crl = checkRevocationByCrl(contents);
+
+        if (crl.checked) {
+            crl.message = crl.message + " OCSP não utilizado ou não conclusivo: " + safeText(ocsp.message);
+            return crl;
+        }
+
+        RevocationOutcome outcome = new RevocationOutcome();
+        outcome.checked = false;
+        outcome.revoked = false;
+        outcome.message = "Revogação não verificada por OCSP nem por LCR. OCSP: " + safeText(ocsp.message) + " LCR: " + safeText(crl.message);
+        return outcome;
+    }
+
+    private RevocationOutcome checkRevocationByOcsp(byte[] contents) {
+        RevocationOutcome outcome = new RevocationOutcome();
+        outcome.method = "OCSP";
+
+        try {
+            CmsCertificateBundle bundle = extractCertificatesFromCms(contents);
+
+            if (bundle.signerCertificate == null) {
+                outcome.checked = false;
+                outcome.revoked = false;
+                outcome.message = "OCSP não verificado: certificado do assinante não localizado no CMS.";
+                return outcome;
+            }
+
+            List<X509Certificate> issuerCandidates = new ArrayList<>();
+            issuerCandidates.addAll(bundle.certificates);
+            issuerCandidates.addAll(fetchIssuerCertificatesByAia(bundle.signerCertificate, bundle.certificates, 5));
+            issuerCandidates.addAll(loadTrustAnchorCertificates());
+
+            X509Certificate issuerCertificate = findIssuerCertificate(bundle.signerCertificate, issuerCandidates);
+
+            if (issuerCertificate == null) {
+                outcome.checked = false;
+                outcome.revoked = false;
+                outcome.message = "OCSP não verificado: certificado emissor não localizado no pacote de assinatura nem por AIA.";
+                return outcome;
+            }
+
+            List<String> ocspUrls = getOcspUrls(bundle.signerCertificate);
+
+            if (ocspUrls.isEmpty()) {
+                outcome.checked = false;
+                outcome.revoked = false;
+                outcome.message = "OCSP não verificado: o certificado não informa endereço OCSP na extensão AIA.";
+                return outcome;
+            }
+
+            List<String> failures = new ArrayList<>();
+
+            for (String ocspUrl : ocspUrls) {
+                try {
+                    OcspCheckResult ocsp = queryOcsp(ocspUrl, bundle.signerCertificate, issuerCertificate);
+
+                    outcome.checked = ocsp.checked;
+                    outcome.method = "OCSP";
+                    outcome.ocspUrl = ocspUrl;
+                    outcome.ocspStatus = ocsp.status;
+                    outcome.ocspResponder = ocsp.responder;
+                    outcome.ocspProducedAt = ocsp.producedAt;
+                    outcome.ocspThisUpdate = ocsp.thisUpdate;
+                    outcome.ocspNextUpdate = ocsp.nextUpdate;
+
+                    if (!ocsp.checked) {
+                        failures.add(ocspUrl + " -> " + safeText(ocsp.message));
+                        continue;
+                    }
+
+                    if (ocsp.revoked) {
+                        outcome.revoked = true;
+                        outcome.revocationDate = ocsp.revocationDate;
+                        outcome.revocationReason = ocsp.revocationReason;
+                        outcome.message = "Consulta de revogação por OCSP realizada. O certificado consta como revogado pelo respondedor OCSP.";
+                        return outcome;
+                    }
+
+                    if ("good".equalsIgnoreCase(ocsp.status)) {
+                        outcome.revoked = false;
+                        outcome.message = "Consulta de revogação por OCSP realizada. O respondedor informou status good para o certificado.";
+                        return outcome;
+                    }
+
+                    failures.add(ocspUrl + " -> status OCSP não conclusivo: " + safeText(ocsp.status));
+                } catch (Exception e) {
+                    failures.add(ocspUrl + " -> " + e.getClass().getSimpleName() + ": " + safeMessage(e));
+                }
+            }
+
+            outcome.checked = false;
+            outcome.revoked = false;
+            outcome.message = "OCSP não verificado: não foi possível obter resposta conclusiva dos endereços OCSP informados. Falhas: " + String.join(" | ", failures);
+            return outcome;
+        } catch (Exception e) {
+            outcome.checked = false;
+            outcome.revoked = false;
+            outcome.message = "OCSP não verificado: " + e.getClass().getSimpleName() + " - " + safeMessage(e);
+            return outcome;
+        }
+    }
+
+    private OcspCheckResult queryOcsp(String ocspUrl, X509Certificate certificate, X509Certificate issuerCertificate) throws Exception {
+        OcspCheckResult result = new OcspCheckResult();
+        result.url = ocspUrl;
+
+        DigestCalculatorProvider digestCalculatorProvider = new JcaDigestCalculatorProviderBuilder()
+                .setProvider(BouncyCastleProvider.PROVIDER_NAME)
+                .build();
+
+        CertificateID certificateId = new CertificateID(
+                digestCalculatorProvider.get(CertificateID.HASH_SHA1),
+                new JcaX509CertificateHolder(issuerCertificate),
+                certificate.getSerialNumber()
+        );
+
+        OCSPReqBuilder requestBuilder = new OCSPReqBuilder();
+        requestBuilder.addRequest(certificateId);
+        OCSPReq request = requestBuilder.build();
+
+        OCSPResp response = postOcspRequest(ocspUrl, request);
+
+        if (response.getStatus() != OCSPResp.SUCCESSFUL) {
+            result.checked = false;
+            result.message = "respondedor OCSP retornou status " + response.getStatus();
+            return result;
+        }
+
+        Object responseObject = response.getResponseObject();
+        if (!(responseObject instanceof BasicOCSPResp basicResponse)) {
+            result.checked = false;
+            result.message = "resposta OCSP sem BasicOCSPResp";
+            return result;
+        }
+
+        result.responder = String.valueOf(basicResponse.getResponderId());
+        result.producedAt = basicResponse.getProducedAt() == null ? null : DATE_FORMAT.format(basicResponse.getProducedAt().toInstant().atZone(ZoneId.systemDefault()));
+
+        if (!isOcspResponseSignatureValid(basicResponse, issuerCertificate)) {
+            result.checked = false;
+            result.message = "assinatura da resposta OCSP não validada com emissor ou respondedor delegado";
+            return result;
+        }
+
+        SingleResp[] responses = basicResponse.getResponses();
+        if (responses == null || responses.length == 0) {
+            result.checked = false;
+            result.message = "resposta OCSP sem SingleResp";
+            return result;
+        }
+
+        SingleResp matched = null;
+        for (SingleResp single : responses) {
+            if (single != null && certificateId.equals(single.getCertID())) {
+                matched = single;
+                break;
+            }
+        }
+
+        if (matched == null) {
+            matched = responses[0];
+        }
+
+        result.thisUpdate = matched.getThisUpdate() == null ? null : DATE_FORMAT.format(matched.getThisUpdate().toInstant().atZone(ZoneId.systemDefault()));
+        result.nextUpdate = matched.getNextUpdate() == null ? null : DATE_FORMAT.format(matched.getNextUpdate().toInstant().atZone(ZoneId.systemDefault()));
+
+        Object status = matched.getCertStatus();
+
+        if (status == CertificateStatus.GOOD || status == null) {
+            result.checked = true;
+            result.revoked = false;
+            result.status = "good";
+            result.message = "OCSP good";
+            return result;
+        }
+
+        if (status instanceof RevokedStatus revokedStatus) {
+            result.checked = true;
+            result.revoked = true;
+            result.status = "revoked";
+            result.revocationDate = revokedStatus.getRevocationTime() == null ? null : DATE_FORMAT.format(revokedStatus.getRevocationTime().toInstant().atZone(ZoneId.systemDefault()));
+            if (revokedStatus.hasRevocationReason()) {
+                result.revocationReason = String.valueOf(revokedStatus.getRevocationReason());
+            }
+            result.message = "OCSP revoked";
+            return result;
+        }
+
+        if (status instanceof UnknownStatus) {
+            result.checked = false;
+            result.revoked = false;
+            result.status = "unknown";
+            result.message = "OCSP unknown";
+            return result;
+        }
+
+        result.checked = false;
+        result.revoked = false;
+        result.status = String.valueOf(status);
+        result.message = "status OCSP não reconhecido";
+        return result;
+    }
+
+    private OCSPResp postOcspRequest(String ocspUrl, OCSPReq request) throws Exception {
+        URL url = URI.create(ocspUrl).toURL();
+        HttpURLConnection connection = (HttpURLConnection) url.openConnection();
+        connection.setConnectTimeout(15000);
+        connection.setReadTimeout(30000);
+        connection.setInstanceFollowRedirects(true);
+        connection.setDoOutput(true);
+        connection.setRequestMethod("POST");
+        connection.setRequestProperty("Content-Type", "application/ocsp-request");
+        connection.setRequestProperty("Accept", "application/ocsp-response");
+        connection.setRequestProperty("User-Agent", "atesta-signature-validator/1.0");
+
+        byte[] encoded = request.getEncoded();
+        connection.setRequestProperty("Content-Length", String.valueOf(encoded.length));
+
+        try (OutputStream out = connection.getOutputStream()) {
+            out.write(encoded);
+        }
+
+        int status = connection.getResponseCode();
+        if (status < 200 || status >= 300) {
+            throw new IllegalStateException("HTTP " + status + " ao consultar OCSP");
+        }
+
+        try (InputStream in = connection.getInputStream()) {
+            return new OCSPResp(in.readAllBytes());
+        } finally {
+            connection.disconnect();
+        }
+    }
+
+    private boolean isOcspResponseSignatureValid(BasicOCSPResp basicResponse, X509Certificate issuerCertificate) {
+        try {
+            ContentVerifierProvider issuerVerifier = new JcaContentVerifierProviderBuilder()
+                    .setProvider(BouncyCastleProvider.PROVIDER_NAME)
+                    .build(issuerCertificate.getPublicKey());
+
+            if (basicResponse.isSignatureValid(issuerVerifier)) {
+                return true;
+            }
+        } catch (Exception ignored) {
+            // tenta certificados de respondedor delegado abaixo
+        }
+
+        try {
+            X509CertificateHolder[] holders = basicResponse.getCerts();
+            if (holders == null || holders.length == 0) {
+                return false;
+            }
+
+            JcaX509CertificateConverter converter = new JcaX509CertificateConverter()
+                    .setProvider(BouncyCastleProvider.PROVIDER_NAME);
+
+            for (X509CertificateHolder holder : holders) {
+                try {
+                    X509Certificate responderCertificate = converter.getCertificate(holder);
+                    responderCertificate.checkValidity();
+
+                    boolean issuedByCertificateIssuer = responderCertificate.getIssuerX500Principal().equals(issuerCertificate.getSubjectX500Principal());
+                    if (issuedByCertificateIssuer) {
+                        responderCertificate.verify(issuerCertificate.getPublicKey());
+                    }
+
+                    boolean sameAsIssuer = responderCertificate.equals(issuerCertificate);
+                    boolean hasOcspEku = false;
+                    try {
+                        List<String> eku = responderCertificate.getExtendedKeyUsage();
+                        hasOcspEku = eku != null && eku.contains(KeyPurposeId.id_kp_OCSPSigning.getId());
+                    } catch (Exception ignored) {
+                        hasOcspEku = false;
+                    }
+
+                    if (!sameAsIssuer && !(issuedByCertificateIssuer && hasOcspEku)) {
+                        continue;
+                    }
+
+                    ContentVerifierProvider responderVerifier = new JcaContentVerifierProviderBuilder()
+                            .setProvider(BouncyCastleProvider.PROVIDER_NAME)
+                            .build(responderCertificate.getPublicKey());
+
+                    if (basicResponse.isSignatureValid(responderVerifier)) {
+                        return true;
+                    }
+                } catch (Exception ignored) {
+                    // tenta o próximo certificado contido na resposta OCSP
+                }
+            }
+        } catch (Exception ignored) {
+            return false;
+        }
+
+        return false;
+    }
+
+    private List<String> getOcspUrls(X509Certificate certificate) {
+        LinkedHashSet<String> urls = new LinkedHashSet<>();
+
+        try {
+            byte[] extensionValue = certificate.getExtensionValue(Extension.authorityInfoAccess.getId());
+
+            if (extensionValue == null) {
+                return new ArrayList<>();
+            }
+
+            ASN1OctetString octets = ASN1OctetString.getInstance(extensionValue);
+            AuthorityInformationAccess aia = AuthorityInformationAccess.getInstance(octets.getOctets());
+
+            for (AccessDescription description : aia.getAccessDescriptions()) {
+                if (!"1.3.6.1.5.5.7.48.1".equals(description.getAccessMethod().getId())) {
+                    continue;
+                }
+
+                GeneralName accessLocation = description.getAccessLocation();
+                if (accessLocation != null && accessLocation.getTagNo() == GeneralName.uniformResourceIdentifier) {
+                    String url = DERIA5String.getInstance(accessLocation.getName()).getString();
+                    if (url != null && !url.isBlank() && (url.startsWith("http://") || url.startsWith("https://"))) {
+                        urls.add(url);
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+            // Sem URL OCSP legível.
+        }
+
+        return new ArrayList<>(urls);
+    }
+
     private RevocationOutcome checkRevocationByCrl(byte[] contents) {
         RevocationOutcome outcome = new RevocationOutcome();
 
@@ -1327,6 +1708,7 @@ public class SignatureValidationService {
                     validateCrlIssuer(crl, issuerCertificate);
 
                     outcome.checked = true;
+                    outcome.method = "CRL";
                     outcome.crlUrl = crlUrl;
                     outcome.crlIssuer = crl.getIssuerX500Principal().getName();
                     outcome.thisUpdate = crl.getThisUpdate() == null ? null : DATE_FORMAT.format(crl.getThisUpdate().toInstant().atZone(ZoneId.systemDefault()));
@@ -1758,9 +2140,31 @@ public class SignatureValidationService {
         List<X509Certificate> certificates = new ArrayList<>();
     }
 
+
+    private static class OcspCheckResult {
+        boolean checked;
+        boolean revoked;
+        String url;
+        String status;
+        String responder;
+        String producedAt;
+        String thisUpdate;
+        String nextUpdate;
+        String revocationDate;
+        String revocationReason;
+        String message;
+    }
+
     private static class RevocationOutcome {
         boolean checked;
         boolean revoked;
+        String method;
+        String ocspUrl;
+        String ocspStatus;
+        String ocspResponder;
+        String ocspProducedAt;
+        String ocspThisUpdate;
+        String ocspNextUpdate;
         String crlUrl;
         String crlIssuer;
         String thisUpdate;
