@@ -1,0 +1,3 @@
+# Testes locais com PDFs reais
+test-pdfs/*.pdf
+test-cases.json
