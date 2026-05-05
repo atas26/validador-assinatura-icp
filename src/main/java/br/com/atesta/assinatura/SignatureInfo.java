@@ -20,6 +20,9 @@ public class SignatureInfo {
     public String certificateIssuer;
     public String certificateNotBefore;
     public String certificateNotAfter;
+    public String certificateSerialNumber;
+public String certificateSerialNumberHex;
+public String certificateIssuerName;
     public List<String> validatorErrors = new ArrayList<>();
     public List<String> validatorWarnings = new ArrayList<>();
 }
