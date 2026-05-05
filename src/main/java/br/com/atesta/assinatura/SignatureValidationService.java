@@ -31,6 +31,8 @@ import java.util.Date;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.pdmodel.interactive.digitalsignature.PDSignature;
@@ -283,6 +285,9 @@ public class SignatureValidationService {
                 out.signatureIntegrityValid = anyValid && byteRangesWellFormed;
                 out.chainValid = anyChainValid;
                 out.standard = anyPades ? "PAdES-B" : "Assinatura PDF";
+                if ("dss_lt_upgrade_no_tsa".equals(out.postSignatureUpdateType) || "dss_ltv_update".equals(out.postSignatureUpdateType)) {
+                    out.standard = "PAdES-B com DSS";
+                }
 
                 if (!byteRangesWellFormed) {
                     out.result = "invalid_signature_byte_range";
@@ -581,12 +586,23 @@ public class SignatureValidationService {
         boolean hasXrefStream = containsAny(compact, "/Type/XRef", "/Type /XRef");
         boolean hasStream = containsAny(compact, "stream", "endstream");
 
-        boolean hasPageContentRisk = containsAny(compact, "/Subtype/Image", "/XObject", "/Font", "/MediaBox", "/CropBox", "/Rotate");
-        boolean hasTextDrawingRisk = containsAny(compact, " BT", " ET", " Tj", " TJ", " Do");
-        boolean hasPageTreeRisk = containsAny(compact, "/Page", "/Pages", "/Annots", "/AcroForm", "/Resources");
-        boolean hasActionRisk = containsAny(compact, "/OpenAction", "/AA", "/JavaScript", "/JS", "/Launch", "/EmbeddedFile", "/RichMedia");
-        boolean hasCatalogOrInfoRisk = containsAny(compact, "/Catalog", "/Root", "/Info", "/Metadata");
+        /*
+         * A atualização DSS/LTV costuma conter CRLs, OCSPs e certificados em streams
+         * binários. A busca de termos diretamente nesses streams gera falso positivo.
+         * Por isso, os riscos de alteração material são pesquisados na estrutura externa,
+         * com os corpos dos streams removidos.
+         */
+        String structureOnly = stripPdfStreamBodies(compact);
+        List<PdfObjectSlice> incrementalObjects = parsePdfObjects(compact);
+
+        boolean hasPageContentRisk = containsAny(structureOnly, "/Subtype/Image", "/XObject", "/MediaBox", "/CropBox", "/Rotate");
+        boolean hasTextDrawingRisk = containsAny(structureOnly, " BT", " ET", " Tj", " TJ", " Do");
+        boolean hasPageTreeRisk = containsAny(structureOnly, "/Page", "/Pages", "/Annots", "/Resources");
+        boolean hasActionRisk = containsAny(structureOnly, "/OpenAction", "/AA", "/JavaScript", "/JS", "/Launch", "/EmbeddedFile", "/RichMedia");
+        boolean hasCatalogOrInfoRisk = containsAny(structureOnly, "/Catalog", "/Root", "/Info", "/Metadata");
         boolean hasMaterialRisk = hasPageContentRisk || hasTextDrawingRisk || hasPageTreeRisk || hasActionRisk;
+        boolean dssLtUpgradeNoTsa = isDssLtUpgradeNoTsa(pdf, offset, incrementalObjects, structureOnly, hasDss, hasDocTimeStamp, hasAdditionalSignature);
+
         boolean hasAnyPdfStructureMarker = hasXrefKeyword
                 || hasTrailerKeyword
                 || hasStartXref
@@ -613,6 +629,7 @@ public class SignatureValidationService {
                 + "; docTimeStamp=" + hasDocTimeStamp
                 + "; assinaturaAdicional=" + hasAdditionalSignature
                 + "; riscoConteudo=" + hasMaterialRisk
+                + "; dssLtUpgradeNoTsa=" + dssLtUpgradeNoTsa
                 + "; bytesNaoBrancos=" + trailingProfile.nonWhitespaceBytes
                 + "; bytesImprimiveis=" + trailingProfile.printableBytes
                 + "; bytesControleOuBinarios=" + trailingProfile.controlOrBinaryBytes
@@ -644,13 +661,6 @@ public class SignatureValidationService {
                 && trailingProfile.nonWhitespaceBytes > 0
                 && trailingProfile.printableBytes == 0;
 
-        /*
-         * PDFs podem receber pequena sobra de bytes após a revisão assinada.
-         * Quando esses bytes não trazem marcadores de estrutura PDF, objeto, stream,
-         * página, recurso, assinatura, DSS/LTV, JavaScript, anexo ou texto imprimível,
-         * o trecho é classificado como sobra binária não referenciada pelo PDF.
-         * A aceitação abaixo é restrita a trechos pequenos, sem sinal de conteúdo material.
-         */
         if (xrefTrailerOnly) {
             analysis.accepted = true;
             analysis.type = "xref_trailer_only_update";
@@ -679,6 +689,13 @@ public class SignatureValidationService {
             return analysis;
         }
 
+        if (dssLtUpgradeNoTsa) {
+            analysis.accepted = true;
+            analysis.type = "dss_lt_upgrade_no_tsa";
+            analysis.message = "Atualização incremental posterior classificada como inclusão de DSS/VRI, certificados e LCRs, com atualização técnica de catálogo por /DSS e /Extensions ESIC. Não foi localizado DocTimeStamp. Classificação: PAdES-B com DSS embarcado, sem TSA suficiente para classificar como PAdES-LT." + diagnostic;
+            return analysis;
+        }
+
         if ((hasDss || hasDocTimeStamp || hasAdditionalSignature) && !hasMaterialRisk) {
             analysis.accepted = true;
             if (hasDocTimeStamp) {
@@ -686,7 +703,7 @@ public class SignatureValidationService {
                 analysis.message = "Atualização incremental posterior classificada como carimbo do tempo documental ou material técnico correlato." + diagnostic;
             } else if (hasDss) {
                 analysis.type = "dss_ltv_update";
-                analysis.message = "Atualização incremental posterior classificada como inclusão de dados de validação DSS/LTV." + diagnostic;
+                analysis.message = "Atualização incremental posterior classificada como inclusão de dados de validação DSS/LTV. A análise ignorou o conteúdo binário interno dos streams de validação para evitar falso positivo de alteração material." + diagnostic;
             } else {
                 analysis.type = "additional_signature_update";
                 analysis.message = "Atualização incremental posterior classificada como acréscimo de assinatura digital adicional." + diagnostic;
@@ -695,9 +712,234 @@ public class SignatureValidationService {
         }
 
         analysis.type = "unknown_incremental_update";
-        analysis.message = "Foi detectada atualização incremental posterior à revisão assinada, mas ela não foi classificada como atualização estrutural, DSS/LTV, carimbo do tempo ou assinatura adicional sem sinals de alteração de conteúdo." + diagnostic
+        analysis.message = "Foi detectada atualização incremental posterior à revisão assinada, mas ela não foi classificada como atualização estrutural, DSS/LTV, carimbo do tempo ou assinatura adicional sem sinais de alteração de conteúdo." + diagnostic
                 + (hasCatalogOrInfoRisk && !hasMaterialRisk ? " Foram encontrados marcadores de catálogo, raiz, informações ou metadados. A ferramenta não aceita automaticamente esse caso sem análise técnica complementar." : "");
         return analysis;
+    }
+
+    private boolean isDssLtUpgradeNoTsa(byte[] pdf, int offset, List<PdfObjectSlice> objects, String structureOnly, boolean hasDss, boolean hasDocTimeStamp, boolean hasAdditionalSignature) {
+        if (!hasDss || hasDocTimeStamp || hasAdditionalSignature || objects == null || objects.isEmpty()) {
+            return false;
+        }
+
+        if (!containsAny(structureOnly, "/DSS") || !containsAny(structureOnly, "/Extensions") || !containsAny(structureOnly, "/ESIC")) {
+            return false;
+        }
+
+        if (containsAny(structureOnly, "/OpenAction", "/AA", "/JavaScript", "/JS", "/Launch", "/EmbeddedFile", "/RichMedia")) {
+            return false;
+        }
+
+        Set<Integer> validationRefs = collectValidationArtifactObjectNumbers(objects);
+        boolean hasCatalogWithDssAndEsic = false;
+        boolean hasDssObject = false;
+        boolean hasVriObject = false;
+
+        for (PdfObjectSlice object : objects) {
+            String body = object.body == null ? "" : object.body;
+            String bodyStructure = stripPdfStreamBodies(body);
+            String normalized = normalizePdfSyntax(bodyStructure);
+
+            if (validationRefs.contains(object.number)) {
+                if (containsAny(bodyStructure, "/Type/DSS", "/Type /DSS")) {
+                    hasDssObject = true;
+                }
+                if (containsAny(bodyStructure, "/Type/VRI", "/Type /VRI")) {
+                    hasVriObject = true;
+                }
+                if (containsAny(bodyStructure, "/OpenAction", "/AA", "/JavaScript", "/JS", "/Launch", "/EmbeddedFile", "/RichMedia")) {
+                    return false;
+                }
+                continue;
+            }
+
+            if (isCatalogDssEsicObject(bodyStructure)) {
+                hasCatalogWithDssAndEsic = true;
+                if (containsAny(bodyStructure, "/OpenAction", "/AA", "/JavaScript", "/JS", "/Launch", "/EmbeddedFile", "/RichMedia")) {
+                    return false;
+                }
+                continue;
+            }
+
+            if (isMetadataObject(bodyStructure) || isInfoDictionaryObject(bodyStructure)) {
+                continue;
+            }
+
+            if (containsAny(bodyStructure, "/Type/Pages", "/Type /Pages", "/Type/Page", "/Type /Page")) {
+                if (isSameAsPreviousObject(pdf, offset, object.number, object.generation, bodyStructure)) {
+                    continue;
+                }
+                return false;
+            }
+
+            if (normalized.isBlank()) {
+                continue;
+            }
+
+            return false;
+        }
+
+        return hasCatalogWithDssAndEsic && hasDssObject && hasVriObject;
+    }
+
+    private List<PdfObjectSlice> parsePdfObjects(String text) {
+        List<PdfObjectSlice> objects = new ArrayList<>();
+        if (text == null || text.isBlank()) {
+            return objects;
+        }
+
+        Pattern pattern = Pattern.compile("(?s)(\\d+)\\s+(\\d+)\\s+obj\\b(.*?)endobj");
+        Matcher matcher = pattern.matcher(text);
+
+        while (matcher.find()) {
+            PdfObjectSlice object = new PdfObjectSlice();
+            object.number = parseIntOrDefault(matcher.group(1), -1);
+            object.generation = parseIntOrDefault(matcher.group(2), 0);
+            object.body = matcher.group(3) == null ? "" : matcher.group(3);
+            objects.add(object);
+        }
+
+        return objects;
+    }
+
+    private Set<Integer> collectValidationArtifactObjectNumbers(List<PdfObjectSlice> objects) {
+        Set<Integer> result = new HashSet<>();
+        if (objects == null || objects.isEmpty()) {
+            return result;
+        }
+
+        boolean changed;
+        do {
+            changed = false;
+            for (PdfObjectSlice object : objects) {
+                String body = object.body == null ? "" : object.body;
+                boolean seed = containsAny(body, "/Type/DSS", "/Type /DSS", "/Type/VRI", "/Type /VRI", "/Certs", "/CRLs", "/OCSPs", "/VRI");
+                if (seed || result.contains(object.number)) {
+                    if (result.add(object.number)) {
+                        changed = true;
+                    }
+                    for (Integer ref : collectObjectReferences(body)) {
+                        if (result.add(ref)) {
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        } while (changed);
+
+        return result;
+    }
+
+    private Set<Integer> collectObjectReferences(String text) {
+        Set<Integer> refs = new HashSet<>();
+        if (text == null || text.isBlank()) {
+            return refs;
+        }
+
+        Pattern pattern = Pattern.compile("(\\d+)\\s+\\d+\\s+R\\b");
+        Matcher matcher = pattern.matcher(text);
+        while (matcher.find()) {
+            refs.add(parseIntOrDefault(matcher.group(1), -1));
+        }
+        refs.remove(-1);
+        return refs;
+    }
+
+    private boolean isCatalogDssEsicObject(String body) {
+        if (body == null) {
+            return false;
+        }
+        return containsAny(body, "/Type/Catalog", "/Type /Catalog")
+                && containsAny(body, "/DSS")
+                && containsAny(body, "/Extensions")
+                && containsAny(body, "/ESIC");
+    }
+
+    private boolean isMetadataObject(String body) {
+        if (body == null) {
+            return false;
+        }
+        return containsAny(body, "/Type/Metadata", "/Type /Metadata", "/Subtype/XML", "/Subtype /XML")
+                && !containsAny(body, "/Subtype/Image", "/JavaScript", "/EmbeddedFile", "/RichMedia");
+    }
+
+    private boolean isInfoDictionaryObject(String body) {
+        if (body == null) {
+            return false;
+        }
+        return containsAny(body, "/Creator", "/Producer", "/CreationDate", "/ModDate", "/Author")
+                && !containsAny(body, "/OpenAction", "/AA", "/JavaScript", "/JS", "/EmbeddedFile", "/RichMedia", "/Subtype/Image");
+    }
+
+    private boolean isSameAsPreviousObject(byte[] pdf, int offset, int number, int generation, String currentBody) {
+        String previous = findPreviousObjectBody(pdf, offset, number, generation);
+        if (previous == null) {
+            return false;
+        }
+        return normalizePdfSyntax(previous).equals(normalizePdfSyntax(currentBody));
+    }
+
+    private String findPreviousObjectBody(byte[] pdf, int offset, int number, int generation) {
+        if (pdf == null || offset <= 0 || offset > pdf.length) {
+            return null;
+        }
+
+        String prefix = new String(pdf, 0, offset, StandardCharsets.ISO_8859_1);
+        Pattern pattern = Pattern.compile("(?s)" + number + "\\s+" + generation + "\\s+obj\\b(.*?)endobj");
+        Matcher matcher = pattern.matcher(prefix);
+
+        String last = null;
+        while (matcher.find()) {
+            last = matcher.group(1);
+        }
+        return last;
+    }
+
+    private String normalizePdfSyntax(String value) {
+        if (value == null) {
+            return "";
+        }
+        return stripPdfStreamBodies(value)
+                .replaceAll("\\s+", "")
+                .trim();
+    }
+
+    private int parseIntOrDefault(String value, int fallback) {
+        try {
+            return Integer.parseInt(value);
+        } catch (Exception e) {
+            return fallback;
+        }
+    }
+
+    private String stripPdfStreamBodies(String text) {
+        if (text == null || text.isEmpty()) {
+            return "";
+        }
+
+        String lower = text.toLowerCase();
+        StringBuilder out = new StringBuilder(text.length());
+        int pos = 0;
+
+        while (pos < text.length()) {
+            int streamStart = lower.indexOf("stream", pos);
+            if (streamStart < 0) {
+                out.append(text, pos, text.length());
+                break;
+            }
+
+            int streamEnd = lower.indexOf("endstream", streamStart + 6);
+            if (streamEnd < 0) {
+                out.append(text, pos, text.length());
+                break;
+            }
+
+            out.append(text, pos, streamStart);
+            out.append("stream\nendstream");
+            pos = streamEnd + "endstream".length();
+        }
+
+        return out.toString();
     }
 
     private TrailingBytesProfile profileTrailingBytes(byte[] pdf, int offset, int length) {
@@ -1482,6 +1724,12 @@ public class SignatureValidationService {
     private String safeMessage(Exception e) {
         Throwable t = e.getCause() != null ? e.getCause() : e;
         return t.getMessage() == null ? t.toString() : t.getMessage();
+    }
+
+    private static class PdfObjectSlice {
+        int number;
+        int generation;
+        String body;
     }
 
     private static class PostSignatureUpdateAnalysis {
