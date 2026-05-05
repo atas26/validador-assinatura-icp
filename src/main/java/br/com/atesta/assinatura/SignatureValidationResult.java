@@ -48,6 +48,11 @@ public class SignatureValidationResult {
     public String revocationDate;
     public String revocationReason;
     public String ocspUrl;
+    public String ocspStatus;
+    public String ocspResponder;
+    public String ocspProducedAt;
+    public String ocspThisUpdate;
+    public String ocspNextUpdate;
 
     // Carimbo do tempo
     public Boolean timestampPresent;
@@ -96,6 +101,11 @@ public class SignatureValidationResult {
         result.revocationDate = null;
         result.revocationReason = null;
         result.ocspUrl = null;
+        result.ocspStatus = null;
+        result.ocspResponder = null;
+        result.ocspProducedAt = null;
+        result.ocspThisUpdate = null;
+        result.ocspNextUpdate = null;
 
         result.timestampPresent = null;
         result.timestampValid = null;
