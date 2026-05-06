@@ -313,6 +313,16 @@ public class SignatureValidationService {
                         out.revocationChecked = true;
                         out.revocationMethod = revocation.method == null || revocation.method.isBlank() ? "CRL" : revocation.method;
 
+                        boolean revocationFresh = isRevocationEvidenceFresh(revocation);
+                        out.revocationStatus = revocation.revoked ? "revoked" : (revocationFresh ? "good" : "indeterminate");
+                        out.revocationSource = out.revocationMethod;
+                        out.revocationEvidenceValid = true;
+                        out.revocationFresh = revocationFresh;
+                        out.revocationCheckedAt = DATE_FORMAT.format(new Date().toInstant().atZone(ZoneId.systemDefault()));
+                        out.revocationThisUpdate = firstNonBlank(revocation.ocspThisUpdate, revocation.thisUpdate);
+                        out.revocationNextUpdate = firstNonBlank(revocation.ocspNextUpdate, revocation.nextUpdate);
+                        out.revocationIndeterminateReason = revocationFresh ? null : "Evidência de revogação expirada ou sem data de próxima atualização válida.";
+
                         if (out.ocspUrl == null || out.ocspUrl.isBlank()) {
                             out.ocspUrl = revocation.ocspUrl;
                         }
@@ -351,14 +361,25 @@ public class SignatureValidationService {
                             out.revocationDate = revocation.revocationDate;
                             out.revocationReason = revocation.revocationReason;
                             info.validatorErrors.add(revocation.message);
-                        } else {
+                        } else if (revocationFresh) {
                             anyNotRevoked = true;
                             if (!Boolean.TRUE.equals(out.revoked)) {
                                 out.revoked = false;
                             }
                             info.validatorWarnings.add(revocation.message);
+                        } else {
+                            if (!Boolean.TRUE.equals(out.revoked)) {
+                                out.revoked = null;
+                            }
+                            info.validatorWarnings.add("Consulta de revogação realizada, mas a atualidade da evidência não foi confirmada: " + safeText(revocation.message));
                         }
                     } else {
+                        out.revocationStatus = "indeterminate";
+                        out.revocationSource = null;
+                        out.revocationEvidenceValid = false;
+                        out.revocationFresh = false;
+                        out.revocationCheckedAt = DATE_FORMAT.format(new Date().toInstant().atZone(ZoneId.systemDefault()));
+                        out.revocationIndeterminateReason = revocation.message;
                         info.validatorWarnings.add(revocation.message);
                     }
                 }
@@ -530,6 +551,15 @@ public class SignatureValidationService {
         out.ocspProducedAt = null;
         out.ocspThisUpdate = null;
         out.ocspNextUpdate = null;
+
+        out.revocationStatus = "not_checked";
+        out.revocationSource = null;
+        out.revocationEvidenceValid = false;
+        out.revocationFresh = false;
+        out.revocationCheckedAt = null;
+        out.revocationThisUpdate = null;
+        out.revocationNextUpdate = null;
+        out.revocationIndeterminateReason = null;
 
         out.timestampPresent = false;
         out.timestampValid = null;
@@ -2472,6 +2502,35 @@ public class SignatureValidationService {
         } catch (Exception ignored) {
             return null;
         }
+    }
+
+    private boolean isRevocationEvidenceFresh(RevocationOutcome revocation) {
+        if (revocation == null || !revocation.checked) {
+            return false;
+        }
+
+        String nextUpdate = firstNonBlank(revocation.ocspNextUpdate, revocation.nextUpdate);
+
+        if (nextUpdate == null || nextUpdate.isBlank()) {
+            return true;
+        }
+
+        try {
+            java.time.OffsetDateTime next = java.time.OffsetDateTime.parse(nextUpdate);
+            return !next.toInstant().isBefore(new Date().toInstant());
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private String firstNonBlank(String first, String second) {
+        if (first != null && !first.isBlank()) {
+            return first;
+        }
+        if (second != null && !second.isBlank()) {
+            return second;
+        }
+        return null;
     }
 
     private String safeText(String value) {
