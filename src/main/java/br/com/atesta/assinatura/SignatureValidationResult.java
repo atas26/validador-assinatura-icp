@@ -54,6 +54,16 @@ public class SignatureValidationResult {
     public String ocspThisUpdate;
     public String ocspNextUpdate;
 
+    // Revogação reforçada
+    public String revocationStatus;
+    public String revocationSource;
+    public Boolean revocationEvidenceValid;
+    public Boolean revocationFresh;
+    public String revocationCheckedAt;
+    public String revocationThisUpdate;
+    public String revocationNextUpdate;
+    public String revocationIndeterminateReason;
+
     // Carimbo do tempo
     public Boolean timestampPresent;
     public Boolean timestampValid;
@@ -108,6 +118,15 @@ public class SignatureValidationResult {
         result.ocspProducedAt = null;
         result.ocspThisUpdate = null;
         result.ocspNextUpdate = null;
+
+        result.revocationStatus = "not_checked";
+        result.revocationSource = null;
+        result.revocationEvidenceValid = false;
+        result.revocationFresh = false;
+        result.revocationCheckedAt = null;
+        result.revocationThisUpdate = null;
+        result.revocationNextUpdate = null;
+        result.revocationIndeterminateReason = message;
 
         result.timestampPresent = null;
         result.timestampValid = null;
