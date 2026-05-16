@@ -11,6 +11,14 @@ public class SignatureValidationResult {
     public Boolean valid;
     public Boolean icpBrasil;
 
+    // Assinatura gov.br/e-gov
+    public Boolean govBr;
+    public Boolean govBrAdvanced;
+    public Boolean govBrIssuerDetected;
+    public String govBrIssuerMatchedBy;
+    public String govBrValidationStatus;
+    public String govBrMessage;
+
     public String standard;
     public String validationLevel;
     public String message;
@@ -85,6 +93,13 @@ public class SignatureValidationResult {
         result.hasSignature = false;
         result.valid = false;
         result.icpBrasil = false;
+
+        result.govBr = false;
+        result.govBrAdvanced = false;
+        result.govBrIssuerDetected = false;
+        result.govBrIssuerMatchedBy = null;
+        result.govBrValidationStatus = null;
+        result.govBrMessage = null;
 
         result.standard = null;
         result.validationLevel = "error";
