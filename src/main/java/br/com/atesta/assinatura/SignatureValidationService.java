@@ -72,6 +72,7 @@ import org.bouncycastle.operator.DigestCalculatorProvider;
 import org.bouncycastle.operator.jcajce.JcaContentVerifierProviderBuilder;
 import org.bouncycastle.operator.jcajce.JcaDigestCalculatorProviderBuilder;
 import org.bouncycastle.cms.CMSSignedData;
+import org.bouncycastle.cms.CMSProcessableByteArray;
 import org.bouncycastle.cms.SignerInformation;
 import org.bouncycastle.cms.SignerInformationStore;
 import org.bouncycastle.cms.jcajce.JcaSimpleSignerInfoVerifierBuilder;
@@ -173,6 +174,19 @@ public class SignatureValidationService {
                 boolean anyTimestampValid = false;
                 boolean anyPolicyDeclared = false;
                 boolean anyPolicyRecognized = false;
+                boolean anyGovBrDetected = false;
+                boolean anyGovBrAdvanced = false;
+                boolean anyGovBrIssuerDetected = false;
+                boolean anyGovBrIntegrityValid = false;
+                boolean anyGovBrCertificateValidAtSigning = false;
+                boolean anyGovBrRevocationChecked = false;
+                boolean anyGovBrNotRevoked = false;
+                boolean anyGovBrRevoked = false;
+                boolean anyGovBrFinalDocumentAcceptable = false;
+                boolean anyGovBrTechnicallyValid = false;
+                String govBrIssuerMatchedBy = null;
+                String govBrValidationStatus = null;
+                String govBrMessage = null;
 
                 for (PDSignature pdSignature : signatures) {
                     SignatureInfo info = extractBasicSignatureInfo(pdSignature, idx++);
@@ -181,6 +195,7 @@ public class SignatureValidationService {
                     boolean byteRangeWellFormed = isByteRangePresentAndWellFormed(pdSignature, pdf.length);
                     boolean byteRangeCoversDocument = byteRangeWellFormed && byteRangeCoversWholeFile(pdSignature, pdf.length);
                     PostSignatureUpdateAnalysis postSignatureUpdate = analyzePostSignatureUpdate(pdSignature, pdf);
+                    boolean signatureFinalDocumentAcceptable = byteRangeWellFormed && (byteRangeCoversDocument || postSignatureUpdate.accepted);
 
                     if (!byteRangeWellFormed) {
                         allByteRangesWellFormed = false;
@@ -238,6 +253,34 @@ public class SignatureValidationService {
                         anyInvalid = true;
                     }
 
+                    GovBrDetectionOutcome govBrDetection = detectGovBrSignature(contents);
+                    if (govBrDetection.detected) {
+                        anyGovBrDetected = true;
+                        anyGovBrAdvanced = anyGovBrAdvanced || govBrDetection.advanced;
+                        anyGovBrIssuerDetected = anyGovBrIssuerDetected || govBrDetection.issuerDetected;
+                        if (govBrIssuerMatchedBy == null || govBrIssuerMatchedBy.isBlank()) {
+                            govBrIssuerMatchedBy = govBrDetection.matchedBy;
+                        }
+                        if (govBrValidationStatus == null || govBrValidationStatus.isBlank()) {
+                            govBrValidationStatus = "detected_govbr";
+                        }
+                        if (govBrMessage == null || govBrMessage.isBlank()) {
+                            govBrMessage = "Assinatura gov.br/e-gov detectada por elementos do emissor ou da cadeia do certificado.";
+                        }
+
+                        info.govBr = true;
+                        info.govBrAdvanced = govBrDetection.advanced;
+                        info.govBrIssuerDetected = govBrDetection.issuerDetected;
+                        info.govBrIssuerMatchedBy = govBrDetection.matchedBy;
+                        info.govBrValidationStatus = "detected_govbr";
+                        info.govBrMessage = "Assinatura gov.br/e-gov detectada por elementos do emissor ou da cadeia do certificado.";
+                    }
+
+                    CmsSignatureIntegrityOutcome cmsIntegrity = validateCmsDetachedSignatureIntegrity(signedContent, contents, info, govBrDetection.detected);
+                    if (govBrDetection.detected && cmsIntegrity.checked && cmsIntegrity.valid) {
+                        anyGovBrIntegrityValid = true;
+                    }
+
                     TimestampValidationOutcome timestamp = inspectSignatureTimestamp(contents, info);
                     if (timestamp.present) {
                         anyTimestampPresent = true;
@@ -276,6 +319,16 @@ public class SignatureValidationService {
                     }
 
                     Date validationDate = pdSignature.getSignDate() == null ? new Date() : pdSignature.getSignDate().getTime();
+                    CertificateValidityOutcome signerCertificateValidity = checkSignerCertificateValidityAtDate(contents, validationDate);
+
+                    if (govBrDetection.detected) {
+                        if (signerCertificateValidity.checked && signerCertificateValidity.valid) {
+                            anyGovBrCertificateValidAtSigning = true;
+                        } else {
+                            info.validatorWarnings.add(signerCertificateValidity.message);
+                        }
+                    }
+
                     ChainValidationOutcome chain = validateIcpBrasilChain(contents, validationDate);
 
                     if (chain.checked) {
@@ -382,6 +435,46 @@ public class SignatureValidationService {
                         out.revocationIndeterminateReason = revocation.message;
                         info.validatorWarnings.add(revocation.message);
                     }
+
+                    if (govBrDetection.detected) {
+                        boolean govBrRevocationFresh = revocation.checked && !revocation.revoked && isRevocationEvidenceFresh(revocation);
+
+                        if (revocation.checked) {
+                            anyGovBrRevocationChecked = true;
+                        }
+
+                        if (revocation.revoked) {
+                            anyGovBrRevoked = true;
+                        } else if (govBrRevocationFresh) {
+                            anyGovBrNotRevoked = true;
+                        }
+
+                        if (signatureFinalDocumentAcceptable) {
+                            anyGovBrFinalDocumentAcceptable = true;
+                        }
+
+                        boolean govBrSignatureAcceptable =
+                                cmsIntegrity.checked
+                                && cmsIntegrity.valid
+                                && signerCertificateValidity.checked
+                                && signerCertificateValidity.valid
+                                && govBrRevocationFresh
+                                && signatureFinalDocumentAcceptable;
+
+                        if (govBrSignatureAcceptable) {
+                            anyGovBrTechnicallyValid = true;
+                            govBrValidationStatus = "valid_govbr_advanced";
+                            govBrMessage = "Assinatura gov.br/e-gov validada tecnicamente.";
+                            info.govBrValidationStatus = "valid_govbr_advanced";
+                            info.govBrMessage = "Assinatura gov.br/e-gov validada tecnicamente.";
+                        } else if (cmsIntegrity.checked && !cmsIntegrity.valid) {
+                            info.govBrValidationStatus = "invalid_govbr_integrity";
+                            info.govBrMessage = "Assinatura gov.br/e-gov detectada, mas a integridade criptográfica não foi confirmada.";
+                        } else {
+                            info.govBrValidationStatus = "indeterminate_govbr_advanced";
+                            info.govBrMessage = "Assinatura gov.br/e-gov detectada, mas nem todos os critérios técnicos foram concluídos automaticamente.";
+                        }
+                    }
                 }
 
                 boolean byteRangesWellFormed = allByteRangesWellFormed;
@@ -401,6 +494,14 @@ public class SignatureValidationService {
                 }
                 out.policyDeclared = anyPolicyDeclared;
                 out.policyRecognized = anyPolicyRecognized;
+
+                out.govBr = anyGovBrDetected;
+                out.govBrAdvanced = anyGovBrAdvanced;
+                out.govBrIssuerDetected = anyGovBrIssuerDetected;
+                out.govBrIssuerMatchedBy = govBrIssuerMatchedBy;
+                out.govBrValidationStatus = govBrValidationStatus;
+                out.govBrMessage = govBrMessage;
+
                 out.standard = anyPades ? "PAdES-B" : "Assinatura PDF";
                 if ("dss_lt_upgrade_no_tsa".equals(out.postSignatureUpdateType) || "dss_ltv_update".equals(out.postSignatureUpdateType)) {
                     out.standard = "PAdES-B com DSS";
@@ -443,6 +544,20 @@ public class SignatureValidationService {
                     out.revocationChecked = true;
                     out.revoked = true;
                     out.message = "Assinatura PAdES-B validada, com cadeia ICP-Brasil reconhecida, mas o certificado consta como revogado na LCR consultada.";
+                } else if (anyGovBrDetected && anyGovBrRevoked) {
+                    out.result = "govbr_certificate_revoked";
+                    out.valid = false;
+                    out.icpBrasil = anyIcp ? true : false;
+                    out.govBr = true;
+                    out.govBrAdvanced = anyGovBrAdvanced;
+                    out.govBrIssuerDetected = anyGovBrIssuerDetected;
+                    out.govBrIssuerMatchedBy = govBrIssuerMatchedBy;
+                    out.govBrValidationStatus = "govbr_certificate_revoked";
+                    out.govBrMessage = "Assinatura gov.br/e-gov detectada, mas o certificado consta como revogado na fonte consultada.";
+                    out.revocationChecked = true;
+                    out.revoked = true;
+                    out.signatureIntegrityValid = anyGovBrIntegrityValid;
+                    out.message = "Assinatura gov.br/e-gov detectada, mas o certificado consta como revogado na fonte consultada.";
                 } else if (anyValid && anyIcp && anyChainValid && anyRevocationChecked && anyNotRevoked) {
                     out.result = finalDocumentCovered
                             ? "valid_icp_brasil_chain_crl"
@@ -467,6 +582,50 @@ public class SignatureValidationService {
                         out.warnings.add("Política de assinatura declarada no pacote assinado: " + safeText(out.policyName) + (out.policyOid == null ? "." : " (OID " + out.policyOid + ")."));
                     } else {
                         out.warnings.add("Política de assinatura ICP-Brasil tipificada não declarada no pacote assinado.");
+                    }
+                } else if (anyGovBrTechnicallyValid) {
+                    out.result = finalDocumentCovered
+                            ? "valid_govbr_advanced"
+                            : "valid_govbr_advanced_with_permitted_incremental_update";
+                    out.valid = true;
+                    out.icpBrasil = anyIcp ? true : false;
+                    out.govBr = true;
+                    out.govBrAdvanced = true;
+                    out.govBrIssuerDetected = anyGovBrIssuerDetected;
+                    out.govBrIssuerMatchedBy = govBrIssuerMatchedBy;
+                    out.govBrValidationStatus = out.result;
+                    out.govBrMessage = "Assinatura gov.br/e-gov validada tecnicamente.";
+                    out.signatureIntegrityValid = true;
+                    out.revocationChecked = true;
+                    out.revoked = false;
+                    out.message = finalDocumentCovered
+                            ? "Assinatura gov.br/e-gov validada tecnicamente. Assinatura PAdES detectada, integridade criptográfica confirmada, certificado vigente na data da assinatura e consulta de revogação realizada sem identificação de revogação."
+                            : "Assinatura gov.br/e-gov validada tecnicamente sobre a revisão assinada. A atualização incremental posterior foi classificada como técnica permitida.";
+                    out.warnings.add("Classificação gov.br/e-gov em trilha própria, sem alterar a validação ICP-Brasil.");
+                    out.warnings.add("A ferramenta não identifica se a conta gov.br usada era prata ou ouro a partir do PDF isolado. O resultado indica compatibilidade técnica com assinatura gov.br/e-gov.");
+                    if (!finalDocumentCovered && anyPostSignatureUpdateAccepted) {
+                        out.warnings.add("O PDF final contém atualização incremental posterior à assinatura. A atualização foi classificada como técnica permitida: " + safeText(out.postSignatureUpdateType) + ".");
+                    }
+                } else if (anyGovBrDetected && anyGovBrIntegrityValid) {
+                    out.result = "govbr_signature_indeterminate";
+                    out.valid = null;
+                    out.icpBrasil = anyIcp ? true : false;
+                    out.govBr = true;
+                    out.govBrAdvanced = anyGovBrAdvanced;
+                    out.govBrIssuerDetected = anyGovBrIssuerDetected;
+                    out.govBrIssuerMatchedBy = govBrIssuerMatchedBy;
+                    out.govBrValidationStatus = "indeterminate_govbr_advanced";
+                    out.govBrMessage = "Assinatura gov.br/e-gov detectada, mas nem todos os critérios técnicos foram concluídos automaticamente.";
+                    out.signatureIntegrityValid = true;
+                    out.message = "Assinatura gov.br/e-gov detectada e integridade criptográfica confirmada, mas a validação automática não concluiu todos os critérios de vigência, revogação ou cobertura do documento final.";
+                    if (!anyGovBrCertificateValidAtSigning) {
+                        out.warnings.add("A vigência do certificado na data da assinatura não foi confirmada automaticamente.");
+                    }
+                    if (!anyGovBrRevocationChecked || !anyGovBrNotRevoked) {
+                        out.warnings.add("A consulta de revogação não foi concluída como evidência atual de certificado não revogado.");
+                    }
+                    if (!anyGovBrFinalDocumentAcceptable) {
+                        out.warnings.add("A cobertura do documento final não foi confirmada como aceitável.");
                     }
                 } else if (anyValid && anyIcp && anyChainValid) {
                     out.result = "valid_icp_brasil_chain_revocation_not_checked";
@@ -518,6 +677,12 @@ public class SignatureValidationService {
         out.hasSignature = false;
         out.valid = null;
         out.icpBrasil = null;
+        out.govBr = false;
+        out.govBrAdvanced = false;
+        out.govBrIssuerDetected = false;
+        out.govBrIssuerMatchedBy = null;
+        out.govBrValidationStatus = null;
+        out.govBrMessage = null;
 
         out.standard = null;
         out.validationLevel = "pades_b_chain_crl_validation";
@@ -2114,6 +2279,209 @@ public class SignatureValidationService {
                 || issuer.contains("ICP BRASIL");
     }
 
+    private GovBrDetectionOutcome detectGovBrSignature(byte[] contents) {
+        GovBrDetectionOutcome outcome = new GovBrDetectionOutcome();
+        outcome.detected = false;
+        outcome.advanced = false;
+        outcome.issuerDetected = false;
+        outcome.matchedBy = null;
+        outcome.message = "Assinatura gov.br/e-gov não detectada.";
+
+        try {
+            CmsCertificateBundle bundle = extractCertificatesFromCms(contents);
+            List<X509Certificate> certificates = new ArrayList<>();
+
+            if (bundle.signerCertificate != null) {
+                certificates.add(bundle.signerCertificate);
+            }
+
+            if (bundle.certificates != null) {
+                certificates.addAll(bundle.certificates);
+            }
+
+            for (X509Certificate certificate : certificates) {
+                String match = matchGovBrCertificateMarker(certificate);
+                if (match != null && !match.isBlank()) {
+                    outcome.detected = true;
+                    outcome.advanced = true;
+                    outcome.issuerDetected = true;
+                    outcome.matchedBy = match;
+                    outcome.message = "Assinatura gov.br/e-gov detectada por " + match + ".";
+                    return outcome;
+                }
+            }
+
+            return outcome;
+        } catch (Exception e) {
+            outcome.detected = false;
+            outcome.advanced = false;
+            outcome.issuerDetected = false;
+            outcome.message = "Não foi possível detectar assinatura gov.br/e-gov: " + e.getClass().getSimpleName() + " - " + safeMessage(e);
+            return outcome;
+        }
+    }
+
+    private String matchGovBrCertificateMarker(X509Certificate certificate) {
+        if (certificate == null) {
+            return null;
+        }
+
+        String subject = certificate.getSubjectX500Principal().getName();
+        String issuer = certificate.getIssuerX500Principal().getName();
+        String combined = subject + " " + issuer;
+        String upper = combined.toUpperCase(java.util.Locale.ROOT);
+        String normalized = normalizeGovBrText(combined);
+
+        if (upper.contains("O=GOV-BR")) {
+            return "O=Gov-Br";
+        }
+
+        if (normalized.contains("AC FINAL DO GOVERNO FEDERAL DO BRASIL")) {
+            return "AC Final do Governo Federal do Brasil";
+        }
+
+        if (normalized.contains("AC INTERMEDIARIA DO GOVERNO FEDERAL DO BRASIL")
+                || normalized.contains("AC INTERMEDIARIA DO GOVERNO FEDERAL DO BRASIL")) {
+            return "AC Intermediária do Governo Federal do Brasil";
+        }
+
+        if (upper.contains("GOV-BR") || upper.contains("GOVBR")) {
+            return "Gov-Br";
+        }
+
+        if (normalized.contains("GOVERNO FEDERAL DO BRASIL")) {
+            return "Governo Federal do Brasil";
+        }
+
+        return null;
+    }
+
+    private String normalizeGovBrText(String value) {
+        return java.text.Normalizer.normalize(String.valueOf(value == null ? "" : value), java.text.Normalizer.Form.NFD)
+                .replaceAll("\\p{M}+", "")
+                .toUpperCase(java.util.Locale.ROOT);
+    }
+
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    private CmsSignatureIntegrityOutcome validateCmsDetachedSignatureIntegrity(byte[] signedContent, byte[] signature, SignatureInfo info, boolean addDiagnostics) {
+        CmsSignatureIntegrityOutcome outcome = new CmsSignatureIntegrityOutcome();
+        outcome.checked = false;
+        outcome.valid = false;
+        outcome.message = "Integridade criptográfica CMS não verificada.";
+
+        try {
+            if (signedContent == null || signedContent.length == 0 || signature == null || signature.length == 0) {
+                outcome.checked = false;
+                outcome.valid = false;
+                outcome.message = "Conteúdo assinado ou assinatura não extraídos do PDF.";
+                if (addDiagnostics && info != null) {
+                    info.validatorWarnings.add(outcome.message);
+                }
+                return outcome;
+            }
+
+            CMSSignedData cms = new CMSSignedData(new CMSProcessableByteArray(signedContent), signature);
+            SignerInformationStore signerStore = cms.getSignerInfos();
+            Collection<SignerInformation> signerInfos = signerStore.getSigners();
+
+            if (signerInfos == null || signerInfos.isEmpty()) {
+                outcome.checked = false;
+                outcome.valid = false;
+                outcome.message = "CMS sem SignerInformation.";
+                if (addDiagnostics && info != null) {
+                    info.validatorWarnings.add(outcome.message);
+                }
+                return outcome;
+            }
+
+            Store certStore = cms.getCertificates();
+            CertificateFactory factory = CertificateFactory.getInstance("X.509");
+            List<String> failures = new ArrayList<>();
+
+            for (SignerInformation signer : signerInfos) {
+                Collection matches = certStore.getMatches(signer.getSID());
+
+                if (matches == null || matches.isEmpty()) {
+                    failures.add("certificado do assinante não localizado para o SignerInformation");
+                    continue;
+                }
+
+                for (Object holder : matches) {
+                    X509Certificate certificate = convertCertificateHolder(holder, factory);
+                    if (certificate == null) {
+                        failures.add("certificado do assinante não convertido");
+                        continue;
+                    }
+
+                    try {
+                        boolean verified = signer.verify(new JcaSimpleSignerInfoVerifierBuilder()
+                                .setProvider(BouncyCastleProvider.PROVIDER_NAME)
+                                .build(certificate));
+
+                        if (verified) {
+                            outcome.checked = true;
+                            outcome.valid = true;
+                            outcome.message = "Integridade criptográfica da assinatura CMS/PAdES confirmada.";
+                            if (addDiagnostics && info != null) {
+                                info.validatorWarnings.add(outcome.message);
+                            }
+                            return outcome;
+                        }
+
+                        failures.add("assinatura CMS não verificada para o certificado do assinante");
+                    } catch (Exception e) {
+                        failures.add(e.getClass().getSimpleName() + ": " + safeMessage(e));
+                    }
+                }
+            }
+
+            outcome.checked = true;
+            outcome.valid = false;
+            outcome.message = "Integridade criptográfica CMS/PAdES não confirmada: " + String.join(" | ", failures);
+            if (addDiagnostics && info != null) {
+                info.validatorWarnings.add(outcome.message);
+            }
+            return outcome;
+        } catch (Exception e) {
+            outcome.checked = false;
+            outcome.valid = false;
+            outcome.message = "Não foi possível verificar a integridade criptográfica CMS/PAdES: " + e.getClass().getSimpleName() + " - " + safeMessage(e);
+            if (addDiagnostics && info != null) {
+                info.validatorWarnings.add(outcome.message);
+            }
+            return outcome;
+        }
+    }
+
+    private CertificateValidityOutcome checkSignerCertificateValidityAtDate(byte[] contents, Date validationDate) {
+        CertificateValidityOutcome outcome = new CertificateValidityOutcome();
+        outcome.checked = false;
+        outcome.valid = false;
+        outcome.message = "Vigência do certificado não verificada.";
+
+        try {
+            CmsCertificateBundle bundle = extractCertificatesFromCms(contents);
+
+            if (bundle.signerCertificate == null) {
+                outcome.message = "Vigência do certificado não verificada: certificado do assinante não localizado no CMS.";
+                return outcome;
+            }
+
+            Date date = validationDate == null ? new Date() : validationDate;
+            bundle.signerCertificate.checkValidity(date);
+
+            outcome.checked = true;
+            outcome.valid = true;
+            outcome.message = "Certificado vigente na data da assinatura.";
+            return outcome;
+        } catch (Exception e) {
+            outcome.checked = true;
+            outcome.valid = false;
+            outcome.message = "Certificado não vigente na data da assinatura: " + e.getClass().getSimpleName() + " - " + safeMessage(e);
+            return outcome;
+        }
+    }
+
     @SuppressWarnings({"unchecked", "rawtypes"})
     private DemoiselleOutcome tryValidateWithDemoiselle(byte[] signedContent, byte[] signature, SignatureInfo info) {
         DemoiselleOutcome outcome = new DemoiselleOutcome();
@@ -2582,6 +2950,26 @@ public class SignatureValidationService {
         boolean checked;
         Boolean valid;
         Boolean icpBrasil;
+        String message;
+    }
+
+    private static class GovBrDetectionOutcome {
+        boolean detected;
+        boolean advanced;
+        boolean issuerDetected;
+        String matchedBy;
+        String message;
+    }
+
+    private static class CmsSignatureIntegrityOutcome {
+        boolean checked;
+        boolean valid;
+        String message;
+    }
+
+    private static class CertificateValidityOutcome {
+        boolean checked;
+        boolean valid;
         String message;
     }
 
