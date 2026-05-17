@@ -25,6 +25,27 @@ public class SignatureInfo {
     public String govBrValidationStatus;
     public String govBrMessage;
 
+    // Resultado técnico individual da assinatura
+    public Boolean valid;
+    public String validationStatus;
+    public String validationMessage;
+    public Boolean signatureIntegrityValid;
+    public Boolean byteRangeValid;
+    public Boolean finalDocumentCovered;
+    public Boolean finalDocumentAcceptable;
+    public Boolean certificateValidAtSigning;
+    public Boolean revocationChecked;
+    public String revocationMethod;
+    public Boolean revoked;
+    public String revocationStatus;
+    public String revocationSource;
+    public Boolean revocationEvidenceValid;
+    public Boolean revocationFresh;
+    public Boolean timestampPresent;
+    public Boolean timestampValid;
+    public String standard;
+    public String validationLevel;
+
     public String certificateSubject;
     public String certificateIssuer;
     public String certificateNotBefore;
