@@ -1133,6 +1133,19 @@ public class SignatureValidationService {
                 && trailingProfile.nonWhitespaceBytes > 0
                 && trailingProfile.printableBytes == 0;
 
+        boolean additionalSignatureIncrementalUpdate = hasAdditionalSignature
+                && containsAny(structureOnly, "/FT /Sig", "/FT/Sig", "/Type /Sig", "/Type/Sig")
+                && containsAny(structureOnly, "/ByteRange")
+                && containsAny(structureOnly, "/Contents")
+                && !containsAny(structureOnly, "/JavaScript", "/JS", "/Launch", "/EmbeddedFile", "/RichMedia");
+
+        if (additionalSignatureIncrementalUpdate) {
+            analysis.accepted = true;
+            analysis.type = "additional_signature_update";
+            analysis.message = "Atualização incremental posterior classificada como acréscimo de assinatura digital adicional, com campos de assinatura, aparência visual e atualização estrutural correlata. Não foram localizados marcadores de JavaScript, arquivo embutido, lançamento externo ou mídia rica." + diagnostic;
+            return analysis;
+        }
+
         if (xrefTrailerOnly) {
             analysis.accepted = true;
             analysis.type = "xref_trailer_only_update";
