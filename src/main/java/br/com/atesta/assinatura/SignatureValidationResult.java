@@ -27,6 +27,17 @@ public class SignatureValidationResult {
     public List<String> errors = new ArrayList<>();
     public List<SignatureInfo> signatures = new ArrayList<>();
 
+    // Contadores de assinaturas
+    public int signatureCount;
+    public int validSignatureCount;
+    public int invalidSignatureCount;
+    public int indeterminateSignatureCount;
+    public int govBrSignatureCount;
+    public int govBrValidSignatureCount;
+    public int govBrInvalidSignatureCount;
+    public int govBrIndeterminateSignatureCount;
+    public int icpBrasilSignatureCount;
+
     // Integridade da assinatura
     public Boolean signatureIntegrityValid;
     public Boolean byteRangeValid;
@@ -152,6 +163,16 @@ public class SignatureValidationResult {
         result.policyName = null;
         result.policyDeclared = false;
         result.policyRecognized = false;
+
+        result.signatureCount = 0;
+        result.validSignatureCount = 0;
+        result.invalidSignatureCount = 0;
+        result.indeterminateSignatureCount = 0;
+        result.govBrSignatureCount = 0;
+        result.govBrValidSignatureCount = 0;
+        result.govBrInvalidSignatureCount = 0;
+        result.govBrIndeterminateSignatureCount = 0;
+        result.icpBrasilSignatureCount = 0;
 
         result.errors.add(message);
 
